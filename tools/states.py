@@ -1,0 +1,2 @@
+FAILURE = False
+SUCCESS = True
