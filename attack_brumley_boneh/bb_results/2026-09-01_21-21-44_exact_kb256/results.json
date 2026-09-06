@@ -1,0 +1,35 @@
+{
+  "attack": "brumley_boneh_crt_rsa_montgomery",
+  "timestamp": "2026-09-01_21-21-44",
+  "params": {
+    "key_bits": 256,
+    "timing": "exact",
+    "neigh": 64,
+    "sample": 1,
+    "batch": 64,
+    "repeat": 1,
+    "tail_brute": 16,
+    "adaptive_neigh": true
+  },
+  "modulus_bits": 256,
+  "qbits_true": 128,
+  "qbits_estimate": 128,
+  "bits_recovered_via_gap": 111,
+  "bits_correct": 111,
+  "per_bit_accuracy": 1.0,
+  "first_error_bit": null,
+  "queries": 35533,
+  "recover_seconds": 13.5227876000572,
+  "char_seconds": 15.139026299933903,
+  "factored": true,
+  "q_true": "9ED3EAB12CE643B2A691EE715AACE2AF",
+  "q_recovered": "9ED3EAB12CE643B2A691EE715AACE2AF",
+  "d_recovered_matches": true,
+  "figures": {
+    "fig1": "fig1_sawtooth_extra_reductions.jpg",
+    "fig2b": "fig2b_neighborhood_gap.jpg",
+    "fig3": "fig3_zero_one_gap_vs_bit.jpg",
+    "fig4": "fig4_gap_histogram.jpg"
+  },
+  "run_dir": "D:\\Projects\\Side-channel-attack-bundle\\side-channel-attack-montMul\\attack_brumley_boneh\\bb_results\\2026-09-01_21-21-44_exact_kb256"
+}
