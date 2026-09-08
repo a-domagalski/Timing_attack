@@ -136,6 +136,55 @@ def load_crt_key(path: str) -> dict:
 # --------------------------------------------------------------------------- #
 # The victim.
 # --------------------------------------------------------------------------- #
+def _limbs(x: int) -> int:
+    """Number of 64-bit words of a non-negative integer (0 -> 0)."""
+    return (x.bit_length() + 63) // 64 if x > 0 else 0
+
+
+def _kara_cost(k: int) -> float:
+    """Karatsuba word-multiply cost ~ k^log2(3) (< schoolbook k*k for k>1)."""
+    return max(1.0, float(k) ** 1.585)
+
+
+def _mult_channel_units(base_eff: int, modulus: int, exponent: int,
+                        kara_threshold_limbs: int) -> float:
+    """Modeled OpenSSL-style multiplication cost, keyed on the operand WORD
+    length -- Brumley-Boneh's *second* discontinuity (the Karatsuba<->schoolbook
+    switch), which our pure-CIOS core omits (it always does full k*k work).
+
+    Returns only the g-DEPENDENT part (the multiply-by-base steps); the
+    base-independent squarings are constant across g/ghi and cancel in the
+    zero-one gap, so they are omitted.
+
+    `base_eff` is the *effective* exponentiation base magnitude, i.e. the
+    Montgomery-converted value (g_guess mod modulus) that the R^{-1} trick
+    produces -- so its word length tracks g_guess (aligned with the reduction
+    sawtooth), not the scrambled raw ciphertext.  Let k = words(modulus),
+    w = words(base_eff).  OpenSSL's BN_mul uses Karatsuba (bn_mul_recursive,
+    ~k^1.585) only when the two operands have the SAME word count and
+    k >= threshold; otherwise schoolbook (bn_mul_normal, ~k*w).  As g_guess
+    crosses a multiple of `modulus`, w jumps between k (base ~= modulus, just
+    below) and < k (base small, just above) -> a discontinuity at the crossing.
+
+    Regimes (both faithful to B-B):
+      * k >= threshold (the 1024-bit RSA regime B-B used): just-below uses
+        Karatsuba (cheaper) while just-above uses schoolbook -> this channel
+        OPPOSES the Montgomery reduction channel, exactly as B-B report.
+      * k <  threshold: schoolbook w-dependence only -> a same-direction
+        discontinuity (short operand above the crossing is cheaper).
+    """
+    k = _limbs(modulus)
+    if k == 0:
+        return 0.0
+    w = _limbs(base_eff)
+    n_mul_by_base = max(0, bin(exponent).count("1") - 1)  # L-R binary ladder
+    if w == k and k >= kara_threshold_limbs:
+        per_mul = _kara_cost(k)
+    else:
+        per_mul = float(k * max(1, w))                    # schoolbook products
+    return n_mul_by_base * per_mul
+
+
 class CRTRSAVictim:
     """Unprotected CRT-RSA decryptor over the C Montgomery core.
 
@@ -148,7 +197,9 @@ class CRTRSAVictim:
     """
 
     def __init__(self, key: dict, timing: str = "exact", batch: int = 64,
-                 repeat: int = 1):
+                 repeat: int = 1, karatsuba: bool = False,
+                 kara_threshold_limbs: int = 8, kara_gain: float = 1.0,
+                 kara_cyc_per_unit: float = 4.0):
         self.n = key["n"]
         self.e = key["e"]
         self.d = key["d"]
@@ -163,6 +214,23 @@ class CRTRSAVictim:
         # queries = logical decryption submissions; ladders = C exponentiations.
         self.queries = 0
         self.hz = mc.tsc_hz(0.1) if timing == "real" else None
+
+        # --- Karatsuba<->schoolbook second channel (B-B's larger discontinuity).
+        # Off by default => victim is the pure-Schindler (extra-reduction) core
+        # exactly as before.  When on, a modeled operand-word-length-dependent
+        # multiplication cost is folded into BOTH oracles.  It is a documented
+        # software model (our shared CIOS DLL is untouched); the physical noise
+        # still rides on the measured C cycles, so in `real` mode this raises the
+        # channel amplitude WITHOUT adding noise -- the intended experiment:
+        # "if the channel were as large as OpenSSL's, would recovery beat this
+        # host's drift?".
+        self.karatsuba = bool(karatsuba)
+        self.kara_threshold_limbs = int(kara_threshold_limbs)
+        self.kara_gain = float(kara_gain)
+        self.kara_cyc_per_unit = float(kara_cyc_per_unit)
+        # radices to recover the effective (Montgomery-converted) base magnitude
+        self._Rq = 1 << (64 * _limbs(self.q))
+        self._Rp = 1 << (64 * _limbs(self.p))
 
     # -- Montgomery radix for the q-exponentiation (public; used by attacker) - #
     def q_radix(self):
@@ -179,23 +247,48 @@ class CRTRSAVictim:
         h = (self.qinv * (m1 - m2)) % self.p
         m = m2 + h * self.q
         self.queries += 1
+
+        mult_units = 0.0
+        if self.karatsuba:
+            # effective (Montgomery-converted) base magnitudes: under the R^{-1}
+            # trick these equal g_guess mod q / mod p, so the multiply-cost
+            # discontinuity aligns with the reduction sawtooth at multiples of q.
+            be_q = (g * self._Rq) % self.q
+            be_p = (g * self._Rp) % self.p
+            mult_units = (
+                _mult_channel_units(be_q, self.q, self.d2,
+                                    self.kara_threshold_limbs)
+                + _mult_channel_units(be_p, self.p, self.d1,
+                                      self.kara_threshold_limbs)
+            )
         return {
             "m": m, "ex_p": ex_p, "ex_q": ex_q, "ex_total": ex_p + ex_q,
-            "cyc_p": cyc_p, "cyc_q": cyc_q,
+            "cyc_p": cyc_p, "cyc_q": cyc_q, "mult_units": mult_units,
         }
 
     def measure(self, cipher: int) -> float:
         """Return the observed side-channel value for one decryption of
-        `cipher`: extra-reduction count (exact) or seconds (real)."""
+        `cipher`: extra-reduction count (exact) or seconds (real).
+
+        When `karatsuba` is enabled the modeled multiplication channel is folded
+        in: added (gain-weighted) to the extra-reduction count in `exact` mode,
+        and as gain*cyc_per_unit modeled cycles to the timed cycles in `real`
+        mode (deterministic offset -> raises signal without adding noise)."""
         if self.timing == "real":
             best = None
             for _ in range(self.repeat):
                 d = self.decrypt_instrumented(cipher, do_time=True)
                 avg_cycles = d["cyc_p"] / self.batch + d["cyc_q"] / self.batch
+                if self.karatsuba:
+                    avg_cycles += (self.kara_gain * self.kara_cyc_per_unit
+                                   * d["mult_units"])
                 best = avg_cycles if best is None else min(best, avg_cycles)
             return best / self.hz
         d = self.decrypt_instrumented(cipher, do_time=False)
-        return float(d["ex_total"])
+        observed = float(d["ex_total"])
+        if self.karatsuba:
+            observed += self.kara_gain * d["mult_units"]
+        return observed
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +329,11 @@ def parse_args():
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--reuse-key", action="store_true")
     ap.add_argument("--key-file", default="subprocess_key_bb.json")
+    ap.add_argument("--karatsuba", action="store_true",
+                    help="add the modeled Karatsuba<->schoolbook mult channel")
+    ap.add_argument("--kara-threshold-limbs", type=int, default=8)
+    ap.add_argument("--kara-gain", type=float, default=1.0)
+    ap.add_argument("--kara-cyc-per-unit", type=float, default=4.0)
     ap.add_argument("--self-test", action="store_true",
                     help="run a correctness self-test and exit")
     return ap.parse_args()
@@ -264,7 +362,10 @@ def main():
         pass
 
     vic = CRTRSAVictim(key, timing=args.timing, batch=args.batch,
-                       repeat=args.repeat)
+                       repeat=args.repeat, karatsuba=args.karatsuba,
+                       kara_threshold_limbs=args.kara_threshold_limbs,
+                       kara_gain=args.kara_gain,
+                       kara_cyc_per_unit=args.kara_cyc_per_unit)
 
     print("{0:X}".format(key["n"]), flush=True)
     print("{0:X}".format(key["e"]), flush=True)
@@ -281,9 +382,13 @@ def main():
             c, do_time=(args.timing == "real"))
         if args.timing == "real":
             avg = info["cyc_p"] / vic.batch + info["cyc_q"] / vic.batch
+            if vic.karatsuba:
+                avg += vic.kara_gain * vic.kara_cyc_per_unit * info["mult_units"]
             observed = avg / vic.hz
         else:
             observed = float(info["ex_total"])
+            if vic.karatsuba:
+                observed += vic.kara_gain * info["mult_units"]
         print(repr(observed), flush=True)
         print("{0:X}".format(info["m"]), flush=True)
 

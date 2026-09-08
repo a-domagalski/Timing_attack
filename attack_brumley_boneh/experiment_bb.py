@@ -46,6 +46,8 @@ REAL_BEAM = 1             # >1 enables confidence beam / backtracking on the noi
                           #    queries, so raise REAL_RECOVER_BITS + REAL_TAIL to
                           #    <=26 for a deep run that can actually factor N).
 REAL_TAIL_BRUTE = 16      # low bits to brute-force at the end of a real run
+REAL_INTERLEAVE = False   # measure g/ghi back-to-back so CPU-frequency drift
+                          #    cancels in the zero-one gap (A/B vs block mode)
 # ---------------------------------------------------------------------------- #
 
 
@@ -62,7 +64,7 @@ def main():
         key_bits=REAL_KEY_BITS, timing="real", neigh=REAL_NEIGH,
         sample=REAL_SAMPLE, batch=REAL_BATCH, repeat=1,
         recover_bits=REAL_RECOVER_BITS, tail_brute=REAL_TAIL_BRUTE,
-        beam_width=REAL_BEAM, make_plots=True,
+        beam_width=REAL_BEAM, interleave=REAL_INTERLEAVE, make_plots=True,
         use_key_cache=True, verbose=True,
     )
 
