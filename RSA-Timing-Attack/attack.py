@@ -1,513 +1,838 @@
-import sys, subprocess, hashlib, shlex, math, binascii, random, copy
-import threading
-from multiprocessing import Process
+"""
+Montgomery-multiplication RSA timing attack (Schindler / Walter style).
+
+It drives the victim process (main.py or the frozen main.exe) which decrypts
+attacker-chosen ciphertexts with an *unprotected* square-and-multiply
+Montgomery exponentiation and leaks a timing signal correlated with the number
+of conditional ("extra") reductions performed by Montgomery multiplication.
+
+Run
+---
+    python attack.py            # everything is configured in-code (see __main__)
+
+There are NO command-line/environment knobs for the analysis: all parameters
+(key size, oracle mode, sample count, beam width, caching, ...) are in-code
+constants in the ``__main__`` block, mirroring
+``side-channel-attack-sqam-only/attack/differential/attack_differential.py``.
+The attacker launches the victim itself and passes the victim's own settings
+(``--key-bits`` / ``--timing`` / ``--repeat`` / ``--reuse-key``) as CLI args.
+
+What it produces (mirrors the differential attack)
+--------------------------------------------------
+Per timestamped results directory ``attack_results_<ts>/``:
+  * ``run_<i>/figs/fig_for_bit_<j>.jpg``   per-bit distinguisher figure
+  * ``run_<i>/figs/fig_data_bit_<j>.json`` the numbers behind each figure
+  * ``run_<i>/results.json``               recovered key, per-bit results, diagnostics
+  * ``run_<i>/measurement_times.json``     per-sample oracle timing (real mode)
+  * ``summary.json``                       all runs combined
+A per-(key-bits, mode) cache under ``mont_cache/`` persists the victim key and
+the collected samples so re-runs skip the (slow, in real mode) collection and
+extend it incrementally.
+
+The private exponent d is recovered MSB-first.  For each candidate bit we
+simulate the exact same Montgomery ladder the victim runs, on the exact same
+base, and partition the sampled ciphertexts by whether the *following squaring*
+would trigger an extra reduction under each hypothesis.  If the bit is 1 that
+multiply actually happened, so the "extra reduction" group is measurably slower
+(estimator A); comparing the two hypotheses cancels the base-dependent bias.
+
+References (which part of the code implements which paper)
+----------------------------------------------------------
+* P. L. Montgomery, Math. Comp. 44 (1985).  -> the algorithm under attack; its
+  conditional final subtraction ("extra reduction") in ``MontMul`` is the leak.
+* P. Kocher, CRYPTO 1996.  -> recover the exponent bit-by-bit from timing.
+* W. Schindler, CHES 2000, LNCS 1965.  -> the canonical Montgomery
+  extra-reduction timing attack; the per-hypothesis decision here is his.
+* C. D. Walter and S. Thompson, CT-RSA 2001.  -> extra reductions leak exponent
+  digits (basis of estimator "A").
+* J.-F. Dhem et al., CARDIS 1998, LNCS 1820.  -> the per-bit group-partitioning
+  / average-time comparison realised here.
+* D. Brumley and D. Boneh, USENIX Security 2003.  -> real-world demonstration of
+  the same channel (motivates the "real" wall-clock oracle mode).
+"""
+
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+import numpy as np
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-global ro
-global ro_s
-global omega
+# --------------------------------------------------------------------------- #
+# Montgomery arithmetic -- MUST match the victim (custom_rsa / main.py).
+# Montgomery (1985): the `if r >= n: r -= n` final subtraction is the leak.
+# --------------------------------------------------------------------------- #
+BASE = 1 << 64
 
-global sampleSize
-sampleSize = 1500
-
-global BASE
-BASE = 2**64
-
-global maxKeySize
-maxKeySize = 256
-
-global treshold
-treshold = 15
-
-global lookAhead
-lookAhead = 3
-
-global interactions
-interactions = 0
-
-def getLimb(x, i):
-    result = (x >> 64*i) & (BASE-1)
-    return result
-
-def calc_ro(modulus_n):
-    ro = 1
-    while ro < modulus_n:
-        ro = ro << 64
-    return  ro
-
-def interact(  c ) :
-    # print("interact(): Did child terminate? (if None - didn't terminate, else - return code):", target.poll())
-
-    global interactions
-    interactions += 1
-    target_in.write("{0:X}".format(c) + "\n")
-    target_in.flush()
-
-    subprocess_rec_cfm = target_out.readline().strip()
-    # print("subprocess_rec_cfm: ", subprocess_rec_cfm)
-
-    subprocess_info = target_out.readline().strip()
-    # print("Subprocess info: ", subprocess_info)
-
-    time = target_out.readline().strip()
-    # print("received time: ", time)
-    time = float(time)
-    # print("time: ", time)
-    message = int(target_out.readline().strip(), 16)
-    # print("message: ",message)
-    return (time, message)
 
 def limbsNr(x):
     return (x.bit_length() + 63) // 64
 
-def calc_ro_square(n):
-    bits = 2 * limbsNr(n) * 64
-    res = 1
-    for i in range(0, bits):
-        res = res * 2
-        while(res > n):
-            res = res - n
-    return res
 
 def getOmega(n):
-    n0 = n & (BASE - 1)   # lowest limb
-    inv = pow(n0, -1, BASE)  # modular inverse
+    n0 = n & (BASE - 1)
+    inv = pow(n0, -1, BASE)
     return (-inv) % BASE
+
 
 def MontMul(x, y, n, omega):
     r = 0
-    base = 1 << 64
-    mask = base - 1
+    mask = BASE - 1
     mods = limbsNr(n)
-
-    for i in range(mods):
+    for _ in range(mods):
         yi = y & mask
         y >>= 64
-
         u = ((r + yi * x) & mask) * omega & mask
-
-        r = r + yi * x + u * n
-        r >>= 64
-        # print("DEBUG MontMul: \nr={}; \nn={}".format(r, n))
-        rBiggerOrEqual = r >= n
-        # print("Is rBiggerOrEqual: ", rBiggerOrEqual)
+        r = (r + yi * x + u * n) >> 64
     if r >= n:
         return r - n, 1
-    else:
-        return r, 0
-
-def computeSamples(n):
-    ro_s = calc_ro_square(n)
-    omega = getOmega(n)
-
-    mont_messages = []
-    messages = []
-    timings = []
-    results = []
-    for j in range(0, sampleSize):
-        m = random.getrandbits(n.bit_length())
-        while m > n :
-            m = random.getrandbits(n.bit_length())
-        messages.append(m)
-        mont_messages.append(MontMul(messages[j], ro_s, n, omega)[0])
-
-        res = interact(m)
-        timings.append(res[0])
-        results.append(res[1])
-    return (messages, mont_messages, timings, results)
-
-# def updateMessages(messages, currentKey, n):
-#     currentSet = messages[:]
-#     for i in range(0, len(messages)):
-#         currentSet[i] = MontMul(currentSet[i], currentSet[i], n, omega)[0]
-
-#     for i in range(0, len(messages)):
-#         for j in range(1, len(currentKey)):
-#             if(currentKey[j] == "1"):
-#                 currentSet[i] = MontMul(currentSet[i], messages[i], n, omega)[0]
-#             currentSet[i] = MontMul(currentSet[i], currentSet[i], n , omega)[0]
-#     return currentSet
-
-def updateMessages(messages, currentKey, n):
-    currentSet = []
-
-    for m in messages:
-        res = ro % n 
-        m_bar = m
-
-        for bit in currentKey:
-            res, _ = MontMul(res, res, n, omega)
-            if bit == "1":
-                res, _ = MontMul(res, m_bar, n, omega)
-
-        currentSet.append(res)
-
-    return currentSet
-
-def checkKey( message, result, d):
-    key_1 = int(d + "1", 2)
-    key_0 = int(d + "0", 2)
-
-    # choose which prediction was right and output key
-    if pow(message, key_1, modulus_n) == result:
-        return (1, "1")
-
-    if pow(message, key_0, modulus_n)== result:
-        return (1, "0")
-
-    return (0, "0")
-
-def getKeySize(n):
-    omega = getOmega(n)
-    ro = calc_ro(n)
-    print("Getting key SIZE")
-
-    message = MontMul(ro, 1, n, omega)[0]
-
-    res = interact(MontMul(1, 1, n, omega)[0])
-    print (res)
-    print (MontMul(1, 1, n, omega)[0])
-    print ("key size recovery finished")
-    # return keySize
-
-class sampleMessages (threading.Thread):
-    def __init__(self, modulus_n, sampleSize):
-        threading.Thread.__init__(self)
-        self.n = modulus_n
-        self.sampleSize = sampleSize
-    def run(self):
-        ro_s = calc_ro_square(self.n)
-        omega = getOmega(self.n)
-        messages = []
-        while len(messages) < self.sampleSize:
-            m = random.getrandbits(modulus_n.bit_length())
-            while m > modulus_n :
-                m = random.getrandbits(modulus_n.bit_length())
-            messages.append(m)
-        self.messages = messages
-    def join(self):
-        return self.messages
-
-def checkAnormal(diff1, diff2):
-    if (abs(diff1 - diff2) < treshold) | ((diff1 < 0) & (diff2 < 0)):
-        return 1
-    return 0
-
-class Group(object):
-    def __init__(self):
-        self.time = 0.0
-        self.size = 0
-
-def simulateStep( mont_messages, currentSet, modulus_n, groups, time  ):
-    # print("DEBUG: simulateStep(): mont_messages={}, currentSet={}, modulus_n={}, groups={}, time={}".format(mont_messages, currentSet, modulus_n, groups, time))
-    encoded_1 = currentSet[:]
-    encoded_0 = currentSet[:]
-    for i in range(0, len(mont_messages)):
-        # assume bit j is 0
-        (encoded_0[i], extra) = MontMul(currentSet[i], currentSet[i], modulus_n, omega)
-        # if extra reduction
-        if extra :
-            groups[3].time += time[i]
-            groups[3].size += 1
-        # if no extra reduction
-        else :
-            groups[4].time += time[i]
-            groups[4].size += 1
-
-        # assume bit = 1
-        (temp, extra1) = MontMul(currentSet[i], currentSet[i], modulus_n, omega)  # square
-        (encoded_1[i], extra2) = MontMul(temp, mont_messages[i], modulus_n, omega)  # multiply
-
-        # if extra reduction
-        if extra1 or extra2 :
-            groups[1].time += time[i]
-            groups[1].size +=1
-        # if no extra reduction
-        else :
-            groups[2].time += time[i]
-            groups[2].size +=1
-    count = 0
-    #=======================================
-    for i in range(len(currentSet)):
-        _, extra = MontMul(currentSet[i], currentSet[i], modulus_n, omega)
-        if extra:
-            count += 1
-
-    print("Extra in square:", count)
-
-    count = 0
-    for i in range(len(currentSet)):
-        temp, _ = MontMul(currentSet[i], currentSet[i], modulus_n, omega)
-        _, extra = MontMul(temp, mont_messages[i], modulus_n, omega)
-        if extra:
-            count += 1
-
-    print("Extra in multiply:", count)
-    #=======================================
-
-    return (groups, encoded_0, encoded_1)
-
-def test(n):
-    omega = getOmega(n)
-
-    count = 0
-    total = 10000
-
-    for _ in range(total):
-        # a = random.randint(1, n-1)
-        # b = random.randint(1, n-1)
-
-        a = n - 1
-        b = n - 1
-
-        _, extra = MontMul(a, b, n, omega)  # NOT Montgomery domain
-
-        if extra:
-            count += 1
-
-    print("extra rate (raw):", count / total)
-
-def avg(group):
-    if group.size == 0:
-        print("Group size is 0")
-        return 0.0
-    else:
-        print("group size is ", group.size)
-    return float(group.time) / group.size
-
-def compute_differences( groups ):
-
-    # compute averaget time for all 4 groups
-    # uF1 = float(groups[1].time)/groups[1].size
-    # uF2 = float(groups[2].time)/groups[2].size
-    # uF3 = float(groups[3].time)/groups[3].size
-    # uF4 = float(groups[4].time)/groups[4].size
-    print("DEBBUG: compute_differences(): groups[1].time: ", groups[1].time)
-    print("DEBBUG: compute_differences(): groups[2].time: ", groups[2].time)
-    print("DEBBUG: compute_differences(): groups[3].time: ", groups[3].time)
-    print("DEBBUG: compute_differences(): groups[4].time: ", groups[4].time)
-    uF1 = avg(groups[1])
-    print("DEBBUG: compute_differences(): uF1: ", uF1)
-    uF2 = avg(groups[2])
-    print("DEBBUG: compute_differences(): uF2: ", uF2)
-    uF3 = avg(groups[3])
-    print("DEBBUG: compute_differences(): uF3: ", uF3)
-    uF4 = avg(groups[4])
-    print("DEBBUG: compute_differences(): uF4: ", uF4)
-
-
-    # compute differences between pari groups
-    diff1 = uF1 - uF2
-    diff2 = uF3 - uF4
-    print("DEBBUG: compute_differences(): diff1: ", diff1)
-    print("DEBBUG: compute_differences(): diff2: ", diff2)
-    return (diff1, diff2)
-
-def look_Ahead(bitCheck, encoded_0, encoded_1, messages, results, mont_messages, modulus_n, time, key):
-    global lookAhead
-
-    key += str(bitCheck)
-    (validKey, bit) = checkKey(messages[0], results[0], key)
-    if validKey :
-        key += str(bit)
-        return (validKey, key, delta)
-
-    if bitCheck :
-        temp_encoded  = encoded_1[:]
-    else:
-        temp_encoded  = encoded_0[:]
-    delta = 0
-    for y in range(0, lookAhead):
-        groups  = [ Group() for i in range(5)]
-
-        (groups, encoded_0, encoded_1 ) = simulateStep( mont_messages, temp_encoded, modulus_n, groups, time );
-
-        (diff1, diff2) = compute_differences( groups )
-
-        bit = 0
-        if diff1 > diff2:
-            bit = 1
-
-        if bit :
-            temp_encoded = encoded_1[:]
-        else:
-            temp_encoded = encoded_0[:]
-        key += str(bit)
-        # print "ver1 : ", len(key_0), ": ",  bit, "------", abs(int(diff1 - diff2)), "--------", int(diff1), int(diff2), "error:", error
-        (validKey, bit) = checkKey(messages[0], results[0], key)
-        if validKey :
-            key += str(bit)
-            return (validKey, key, delta)
-
-        if not checkAnormal(diff1, diff2) :
-            delta += abs(int(diff1 - diff2))
-
-    return (validKey, key, delta)
-
-def attack(modulus_n, e):
-    global sampleSize
-
-    # set start conditions
-    validKey = 0
-    keySize  = 64
-    foundKey = "1"
-
-    # while the key is within the limits of the maximum key and it is not valid
-    while (keySize < maxKeySize) &  (not validKey):
-        print("DEBUG: attack(): while loop start")
-        # re-initialise everything
-        messages        = []
-        mont_messages   = []
-        currentSet      = []
-        results         = []
-        time            = []
-        stablekeySet    = 0
-        error           = 0
-
-        # generate new sample messages of modulus_n bits
-        generateMessages = sampleMessages(modulus_n, sampleSize)
-        generateMessages.run()
-
-        # add new messages to the current set of messages
-        messages += generateMessages.join()
-
-        # reset key to stable key
-        currentKey = foundKey
-
-        # compute times taken to decrypt each message
-        print("Refer to subprocess (get time and encrypted message for each sample message)")
-        for i in range(0, len(messages)):
-
-            # get times for each message ( res[0] is the time taken to decrypt, and res[1] is decrypted message)
-            res = interact(messages[i])
-            results.append(res[1])
-            time.append( res[0] )
-
-            # transform each message into montgomery form
-            mont_messages.append(MontMul(messages[i], ro_s, modulus_n, omega)[0])
-
-        print ("Sample Size: ", sampleSize)
-        print ("Interactions: ", interactions)
-        print ("Start from key bit ", len(currentKey))
-
-        currentSet = updateMessages(mont_messages, currentKey, modulus_n)
-        encoded_1 = currentSet[:]
-        encoded_0 = currentSet[:]
-
-        # discover the next bits untill the last bit which needs to be guessed
-        while ((len( currentKey ) <= keySize) & (error < 7)):
-            warning = 0
-            groups  = [ Group() for i in range(5)]
-
-            (groups, encoded_0, encoded_1 ) = simulateStep( mont_messages, currentSet, modulus_n, groups, time )
-
-            (diff1, diff2) = compute_differences( groups )
-
-            # condition for anormal behaviour
-            if checkAnormal(diff1, diff2) :
-                warning = 1
-                error += 2
-            else :
-                if error > 0:
-                    error -= 1
-                warning = 0
-
-            if warning > 0 :
-                print ("warning at bit", len( currentKey ))
-                stablekeySet = 1
-
-                # check following rounds for bit 0
-                (validKey, possibleKey, delta0) = look_Ahead(0, encoded_0, encoded_1, messages, results, mont_messages, modulus_n, time, currentKey)
-                if(validKey):
-                    return possibleKey
-
-                # check following rounds for bit 1
-                (validKey, possibleKey, delta1) = look_Ahead(1, encoded_0, encoded_1, messages, results, mont_messages, modulus_n, time, currentKey)
-                if(validKey):
-                    return possibleKey
-
-                # decide which set was better
-                if(delta0 < delta1) :
-                    bit = 1
-                else :
-                    bit = 0
-
-            else :
-                #if diff for the groups with assumed bit = 1 is bigger than the diff of the groups with assumed bit = 0, then predict 1, else predict 0
-                if diff1 > diff2:
-                    bit = 1
-                else :
-                    bit = 0
-
-                if(not stablekeySet):
-                    foundKey = currentKey
-
-            # depending on which bit is predicted, keep the results computed with that bit for the next round
-            if bit == 1:
-                currentSet = encoded_1[:]
+    return r, 0
+
+
+# --------------------------------------------------------------------------- #
+# Terminal helpers (progress bar / ETA), matching the differential attack.
+# --------------------------------------------------------------------------- #
+def _fmt_dur(seconds):
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m_, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m_:02d}m{s:02d}s"
+    if m_:
+        return f"{m_}m{s:02d}s"
+    return f"{s}s"
+
+
+def _bar_fill_chars():
+    enc = (getattr(sys.stdout, "encoding", None) or "ascii").lower()
+    try:
+        "\u2588\u2591".encode(enc)
+        return "\u2588", "\u2591"
+    except (UnicodeEncodeError, LookupError):
+        return "#", "-"
+
+
+def _progress_bar(done, total, width=28):
+    frac = done / total if total else 1.0
+    filled = int(round(frac * width))
+    fill, empty = _bar_fill_chars()
+    return (
+        f"[{fill * filled}{empty * (width - filled)}] {done}/{total} {frac * 100:3.0f}%"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess (victim) plumbing
+# --------------------------------------------------------------------------- #
+class Target:
+    def __init__(self, argv):
+        self.proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.n = int(self._readline(), 16)
+        self.e = int(self._readline(), 16)
+        self.queries = 0
+
+    def _readline(self):
+        line = self.proc.stdout.readline()
+        if line == "":
+            raise EOFError("target terminated unexpectedly")
+        return line.strip()
+
+    def decrypt(self, c):
+        """Send ciphertext c, return (time, plaintext)."""
+        self.queries += 1
+        self.proc.stdin.write("{0:X}\n".format(c))
+        self.proc.stdin.flush()
+        t = float(self._readline())
+        m = int(self._readline(), 16)
+        return t, m
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        self.proc.terminate()
+
+
+# --------------------------------------------------------------------------- #
+# Measurement collection (with progress bar + ETA + per-sample log)
+# --------------------------------------------------------------------------- #
+def collect_samples(target, sample_size, start_index=0, verbose=True):
+    """Query the victim on random ciphertexts; return (cs, times, plaintexts,
+    collect_log). `start_index` only shifts the printed sample counter so that an
+    incremental extension of a cache reads naturally."""
+    n = target.n
+    cs, times, plaintexts, collect_log = [], [], [], []
+    loop_start = time.perf_counter()
+    for i in range(sample_size):
+        c = random.randrange(1, n)
+        t, m = target.decrypt(c)
+        cs.append(c)
+        times.append(t)
+        plaintexts.append(m)
+        done = i + 1
+        elapsed = time.perf_counter() - loop_start
+        collect_log.append(
+            {"sample": start_index + done, "reported_time": float(t),
+             "elapsed_s": float(elapsed)}
+        )
+        if verbose and (done % 100 == 0 or done == sample_size):
+            avg = elapsed / done
+            eta = avg * (sample_size - done)
+            print(
+                f"\r  {_progress_bar(done, sample_size)} | "
+                f"elapsed {_fmt_dur(elapsed)} | ETA {_fmt_dur(eta)}   ",
+                end="", flush=True,
+            )
+    if verbose:
+        print(flush=True)
+    return cs, times, plaintexts, collect_log
+
+
+# --------------------------------------------------------------------------- #
+# Persistence / caching.
+# Re-running the attack (to retune the beam / regenerate plots) should NOT
+# repeat the (slow, in real mode) collection.  When a `cache_dir` is given we
+# persist, under it:
+#   victim_key.txt   the key the victim generated/reloaded (n, e, d)
+#   samples.json     the collected (c, time, plaintext) triples + a signature of
+#                    every parameter they depend on; a mismatch re-collects.
+# The sample list is grown incrementally: a re-run reuses the cached samples as a
+# prefix and collects only the additional ones.  NOTE (real mode): a cached set
+# freezes ONE noise realisation — ideal for iterating on the analysis, but for an
+# independent noise-robustness study delete samples.json (or disable the cache).
+# --------------------------------------------------------------------------- #
+def _samples_signature(n, key_bits, timing, repeat):
+    sig = {"n": str(n), "key_bits": int(key_bits), "timing": timing}
+    if timing == "real":
+        sig["repeat"] = int(repeat)
+    return sig
+
+
+def load_samples_cache(cache_dir, signature):
+    path = os.path.join(cache_dir, "samples.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    if data.get("signature") != signature:
+        return None
+    cs = [int(x, 16) for x in data["cs"]]
+    times = [float(t) for t in data["times"]]
+    plaintexts = [int(x, 16) for x in data["plaintexts"]]
+    return cs, times, plaintexts
+
+
+def save_samples_cache(cache_dir, signature, cs, times, plaintexts):
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "samples.json")
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "signature": signature,
+                "cs": ["{0:X}".format(c) for c in cs],
+                "times": [float(t) for t in times],
+                "plaintexts": ["{0:X}".format(m) for m in plaintexts],
+            },
+            f,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Distinguisher core (estimator A).
+# --------------------------------------------------------------------------- #
+def _bit_stats(res, base_bars, times, n, omega):
+    """For the current per-ciphertext state `res`, look one step ahead: the
+    always-present squaring, the conditional multiply, and the *following*
+    squaring under each hypothesis.  Partition the measured `times` by whether
+    that following squaring triggers an extra reduction and return the two
+    hypothesis margins plus everything needed to plot / advance.
+
+        delta1 = mean(time | following-sq reduces under bit=1) - mean(| not)
+        delta0 = mean(time | following-sq reduces under bit=0) - mean(| not)
+        margin = delta1 - delta0        (>0 => bit is 1)
+    """
+    ncts = len(res)
+    enc0 = [0] * ncts
+    enc1 = [0] * ncts
+    e1_mask = np.zeros(ncts, dtype=bool)
+    e0_mask = np.zeros(ncts, dtype=bool)
+    for i in range(ncts):
+        sq, _ = MontMul(res[i], res[i], n, omega)
+        m1, _ = MontMul(sq, base_bars[i], n, omega)
+        enc0[i], enc1[i] = sq, m1
+        _, ex1 = MontMul(m1, m1, n, omega)   # following square if bit == 1
+        _, ex0 = MontMul(sq, sq, n, omega)   # following square if bit == 0
+        e1_mask[i] = bool(ex1)
+        e0_mask[i] = bool(ex0)
+
+    t = np.asarray(times, dtype=np.float64)
+
+    def _delta(mask):
+        hi, lo = t[mask], t[~mask]
+        mh = hi.mean() if len(hi) else 0.0
+        ml = lo.mean() if len(lo) else 0.0
+        return float(mh - ml), float(mh), float(ml), int(len(hi)), int(len(lo))
+
+    delta1, m1h, m1l, s1h, s1l = _delta(e1_mask)
+    delta0, m0h, m0l, s0h, s0l = _delta(e0_mask)
+    return {
+        "delta1": delta1, "delta0": delta0, "margin": delta1 - delta0,
+        "e1_mask": e1_mask, "e0_mask": e0_mask, "enc0": enc0, "enc1": enc1,
+        "h1": (m1h, m1l, s1h, s1l), "h0": (m0h, m0l, s0h, s0l),
+    }
+
+
+def _auc(scores, labels):
+    """ROC-AUC via Mann-Whitney U. 0.5 = no signal, 1.0 = perfect."""
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels).astype(bool)
+    pos, neg = scores[labels], scores[~labels]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(len(scores), dtype=np.float64)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    u = ranks[labels].sum() - len(pos) * (len(pos) + 1) / 2.0
+    return float(u / (len(pos) * len(neg)))
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics: raw per-bit signal walked along the TRUE key (no error
+# propagation) — isolates the measurement SNR, mirroring the differential
+# attack's oracle_separability().
+# --------------------------------------------------------------------------- #
+def oracle_separability(true_d, cs, times, base_bars, n, omega, R_mod_n, unit):
+    dbits = bin(true_d)[2:]
+    res = [R_mod_n] * len(cs)
+    # consume leading '1'
+    for i in range(len(cs)):
+        r, _ = MontMul(res[i], res[i], n, omega)
+        r, _ = MontMul(r, base_bars[i], n, omega)
+        res[i] = r
+
+    margins, labels = [], []
+    correct = 0
+    for pos in range(1, len(dbits)):
+        st = _bit_stats(res, base_bars, times, n, omega)
+        margins.append(st["margin"])
+        bit = int(dbits[pos])
+        labels.append(bit)
+        if (st["margin"] > 0) == bool(bit):
+            correct += 1
+        res = st["enc1"] if dbits[pos] == "1" else st["enc0"]
+
+    margins, labels = np.array(margins), np.array(labels)
+    auc = _auc(margins, labels)
+    m1 = margins[labels == 1].mean() if (labels == 1).any() else float("nan")
+    m0 = margins[labels == 0].mean() if (labels == 0).any() else float("nan")
+    acc = correct / len(labels) if len(labels) else float("nan")
+    print("\nOracle-prefix per-bit separability (estimator A on the TRUE key):")
+    print(f"  mean margin  bit=1: {m1:+.4g}{unit}   bit=0: {m0:+.4g}{unit}")
+    print(f"  per-bit sign accuracy: {correct}/{len(labels)} = {acc*100:.1f}%")
+    print(f"  AUC(margin -> bit): {auc:.3f}   (0.5 = no signal, 1.0 = perfect)")
+    return {
+        "auc": auc,
+        "mean_margin_bit1": float(m1),
+        "mean_margin_bit0": float(m0),
+        "true_prefix_per_bit_acc": float(acc),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Recovery — exact reduction-count oracle (fixed-width beam over the exact
+# two-sided invariant).  Unchanged algorithm; beam width is an in-code param.
+# --------------------------------------------------------------------------- #
+def recover_exact(cs, times, plaintexts, base_bars, n, omega, R_mod_n,
+                  key_is_correct, verbose, beam_width=32):
+    M = [int(t) for t in times]
+    ncts = len(cs)
+    max_bits = n.bit_length() + 8
+
+    def avg(total, size):
+        return total / size if size else 0.0
+
+    def expand(res, cnt, cur_len):
+        t1_hi = t1_lo = 0.0
+        s1_hi = s1_lo = 0
+        t0_hi = t0_lo = 0.0
+        s0_hi = s0_lo = 0
+        enc0 = [0] * ncts
+        enc1 = [0] * ncts
+        ex_sq = [0] * ncts
+        ex_mul = [0] * ncts
+        for i in range(ncts):
+            sq, exs = MontMul(res[i], res[i], n, omega)
+            m1, exm = MontMul(sq, base_bars[i], n, omega)
+            enc0[i], enc1[i] = sq, m1
+            ex_sq[i], ex_mul[i] = exs, exm
+            _, e1 = MontMul(m1, m1, n, omega)
+            _, e0 = MontMul(sq, sq, n, omega)
+            if e1:
+                t1_hi += M[i]; s1_hi += 1
             else:
-                currentSet = encoded_0[:]
+                t1_lo += M[i]; s1_lo += 1
+            if e0:
+                t0_hi += M[i]; s0_hi += 1
+            else:
+                t0_lo += M[i]; s0_lo += 1
+        margin = (avg(t1_hi, s1_hi) - avg(t1_lo, s1_lo)) \
+            - (avg(t0_hi, s0_hi) - avg(t0_lo, s0_lo))
 
-            # add the predicted bit to the key
-            currentKey += str(bit)
-            (validKey, bit ) = checkKey(messages[0], results[0], currentKey)
-            if validKey:
-                return currentKey + str(bit)
+        remaining_cap = 2 * max(0, n.bit_length() - (cur_len + 1))
+        children = []
+        for bit in ("1", "0"):
+            new_cnt = list(cnt)
+            ok = True
+            for i in range(ncts):
+                new_cnt[i] += ex_sq[i]
+                if bit == "1":
+                    new_cnt[i] += ex_mul[i]
+                if new_cnt[i] > M[i]:
+                    ok = False
+                    break
+                if M[i] - new_cnt[i] > remaining_cap:
+                    ok = False
+                    break
+            if ok:
+                children.append((bit, enc1 if bit == "1" else enc0, new_cnt))
+        return margin, children
 
-        else :
-            keySize += 16
-            sampleSize += 1000
-    return currentKey
+    # Leading bit is 1; consume it (square then multiply).
+    res0 = [0] * ncts
+    cnt0 = [0] * ncts
+    for i in range(ncts):
+        r, ex = MontMul(R_mod_n, R_mod_n, n, omega)
+        cnt0[i] += ex
+        r, ex = MontMul(r, base_bars[i], n, omega)
+        cnt0[i] += ex
+        res0[i] = r
 
-if ( __name__ == "__main__" ) :
+    beam = [[0.0, "1", res0, cnt0]]
+    best_key = "1"
+    depth = 1
+    while beam:
+        depth += 1
+        if depth > max_bits:
+            break
+        candidates = []
+        for score, key, res, cnt in beam:
+            margin, children = expand(res, cnt, len(key))
+            for bit, cres, ccnt in children:
+                ckey = key + bit
+                if key_is_correct(ckey):
+                    if verbose:
+                        print("  full exponent verified at {} bits".format(len(ckey)))
+                    return ckey
+                conf = margin if bit == "1" else -margin
+                candidates.append([score + conf, ckey, cres, ccnt])
+        if not candidates:
+            break
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        beam = candidates[:beam_width]
+        if len(beam[0][1]) > len(best_key):
+            best_key = beam[0][1]
+        if verbose and depth % 8 == 0:
+            print("  depth={} beam={} best_len={} top_score={:.3f}"
+                  .format(depth, len(beam), len(best_key), beam[0][0]))
 
-    # if len(sys.argv) < 3 :
-    #   raise Exception("not enough argv")
+    return best_key
 
-    # inputFile = open(sys.argv[2])
-    # modulus_n = int(inputFile.readline(), 16)
-    # e = int(inputFile.readline(), 16)
-    # inputFile.close()
 
-    if len(sys.argv) < 2 :
-      raise Exception("not enough argv")
-
-    print("sys.argv[ 1 ]: ", sys.argv[ 1 ])
-    print("Making a sub process representing the attack target.")
-  # Produce a sub-process representing the attack target.
-    target = subprocess.Popen( args=sys.argv[ 1 ],
-                             stdout=subprocess.PIPE,
-                             stdin=subprocess.PIPE,
-                             stderr=subprocess.STDOUT,
-                             text=True )
-    print("Constructing handles to attack target standard input and output.")
-  # Construct handles to attack target standard input and output.
-    target_out = target.stdout
-    target_in  = target.stdin
-
-    print("Reading modulus n and e values from subprocess stdout")
-    print("Did child terminate? (if None - didn't terminate, else - return code):", target.poll())
-    Info = target_out.readline().strip()
-    print("Initial child process info: ", Info)
-
-    modulus_n =  int(target_out.readline().strip(), 16)
-
-    exit()
-    e = int(target_out.readline().strip(), 16)
-    # print("Modulus n value: {0}, public component e: {1}".format(modulus_n, e))
+# --------------------------------------------------------------------------- #
+# Recovery — noisy wall-clock oracle (greedy Schindler/Dhem decision).
+# --------------------------------------------------------------------------- #
+def recover_statistical(cs, times, plaintexts, base_bars, n, omega, R_mod_n,
+                        key_is_correct, verbose):
     key = "1"
+    res = [R_mod_n] * len(cs)
+    for i in range(len(cs)):
+        r, _ = MontMul(res[i], res[i], n, omega)
+        r, _ = MontMul(r, base_bars[i], n, omega)
+        res[i] = r
+    max_bits = n.bit_length() + 8
+    for _ in range(max_bits):
+        st = _bit_stats(res, base_bars, times, n, omega)
+        bit = "1" if st["margin"] > 0 else "0"
+        key += bit
+        res = st["enc1"] if bit == "1" else st["enc0"]
+        if verbose and len(key) % 16 == 0:
+            print("  recovered {} bits (delta1={:.4e} delta0={:.4e})"
+                  .format(len(key), st["delta1"], st["delta0"]))
+        if key_is_correct(key):
+            if verbose:
+                print("  full exponent verified at {} bits".format(len(key)))
+            return key
+    return key
 
-    global ro
-    ro   = calc_ro(modulus_n)
 
-    global ro_s
-    ro_s = calc_ro_square(modulus_n)
+# --------------------------------------------------------------------------- #
+# Analyse the recovered key: walk it MSB-first, plotting the per-bit
+# distinguisher and recording per-bit results vs the true key.
+# --------------------------------------------------------------------------- #
+def analyze_and_plot(recovered_key, true_d, cs, times, base_bars, n, omega,
+                     R_mod_n, figures_dir, make_plots, unit, scale):
+    dbits_true = bin(true_d)[2:]
+    rbits = recovered_key
+    res = [R_mod_n] * len(cs)
+    for i in range(len(cs)):
+        r, _ = MontMul(res[i], res[i], n, omega)
+        r, _ = MontMul(r, base_bars[i], n, omega)
+        res[i] = r
 
-    global omega
-    omega = getOmega(modulus_n)
-    # Execute a function representing the attacker.
-    print("starting attack analysis")
-    key = attack(modulus_n, e)
-    print("attack analysis ended")
+    bit_results = []
+    correct = 1  # MSB (bit 0) is always 1
+    for pos in range(1, len(rbits)):
+        st = _bit_stats(res, base_bars, times, n, omega)
+        decision = int(rbits[pos])
+        actual = int(dbits_true[pos]) if pos < len(dbits_true) else None
+        ok = (actual is not None and decision == actual)
+        correct += int(ok)
+
+        bit_results.append({
+            "bit_position": pos,
+            "actual_bit": actual,
+            "predicted_bit": decision,
+            "success": bool(ok),
+            "delta1": st["delta1"],
+            "delta0": st["delta0"],
+            "margin": st["margin"],
+        })
+
+        if make_plots and figures_dir is not None:
+            _plot_bit(pos, times, st, decision, actual, figures_dir, unit, scale)
+
+        res = st["enc1"] if decision == 1 else st["enc0"]
+
+    return bit_results, correct
+
+
+def _plot_bit(pos, times, st, decision, actual, figures_dir, unit, scale):
+    """Three-panel figure in the differential-attack style: the measured signal
+    (top) and, for each hypothesis, the measured signal split by whether the
+    following squaring triggers an extra reduction (bottom).  The correct
+    hypothesis shows a visible gap between its two groups (delta); the wrong one
+    does not."""
+    t = np.asarray(times, dtype=np.float64) * scale
+    e1 = st["e1_mask"]
+    e0 = st["e0_mask"]
+    n_bins = 30
+
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(2, 2)
+
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.hist(t, bins=n_bins, alpha=0.7, color="skyblue", edgecolor="black")
+    ax1.axvline(t.mean(), color="navy", linestyle="--", linewidth=2,
+                label=f"Mean: {t.mean():.3f}{unit}")
+    ax1.set_xlabel(f"Measured decryption signal ({unit})")
+    ax1.set_ylabel("Frequency")
+    ax1.set_title(f"Measured oracle signal (bit {pos})")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    def _panel(ax, mask, delta, title):
+        hi, lo = t[mask], t[~mask]
+        if len(lo):
+            ax.hist(lo, bins=n_bins, alpha=0.6, color="lightsteelblue",
+                    edgecolor="black", label=f"no extra-red (n={len(lo)})")
+            ax.axvline(lo.mean(), color="navy", linestyle="--", linewidth=2)
+        if len(hi):
+            ax.hist(hi, bins=n_bins, alpha=0.6, color="salmon",
+                    edgecolor="black", label=f"extra-red (n={len(hi)})")
+            ax.axvline(hi.mean(), color="darkred", linestyle="--", linewidth=2)
+        ax.set_xlabel(f"Measured signal ({unit})")
+        ax.set_ylabel("Frequency")
+        ax.set_title(f"{title}   delta={delta * scale:+.3g}{unit}")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    _panel(fig.add_subplot(gs[1, 0]), e0, st["delta0"],
+           "H0 (bit = 0): group by following-square reduction")
+    _panel(fig.add_subplot(gs[1, 1]), e1, st["delta1"],
+           "H1 (bit = 1): group by following-square reduction")
+
+    fig.suptitle(
+        f"bit {pos}: margin={st['margin'] * scale:+.3g}{unit}  "
+        f"pred={decision}  actual={actual}",
+        fontsize=14,
+    )
+    fig.tight_layout()
+    fig.savefig(os.path.join(figures_dir, f"fig_for_bit_{pos}.jpg"))
+    plt.close(fig)
+
+    with open(os.path.join(figures_dir, f"fig_data_bit_{pos}.json"), "w") as f:
+        json.dump({
+            "bit_position": pos,
+            "predicted_bit": decision,
+            "actual_bit": actual,
+            "delta1": st["delta1"],
+            "delta0": st["delta0"],
+            "margin": st["margin"],
+            "h1_hi_mean_lo_mean_hi_n_lo_n": st["h1"],
+            "h0_hi_mean_lo_mean_hi_n_lo_n": st["h0"],
+            "unit": unit,
+            "scale": scale,
+        }, f)
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+def montgomery_attack(
+    target_argv,
+    key_bits,
+    timing,
+    repeat,
+    num_samples,
+    beam_width=32,
+    cache_dir=None,
+    use_sample_cache=False,
+    figures_dir=None,
+    make_plots=True,
+    timing_out_path=None,
+    verbose=True,
+):
+    """Full Montgomery extra-reduction attack against the subprocess victim.
+    Returns (recovered_d, accuracy, bit_results, diag)."""
+    print("Montgomery extra-reduction timing attack")
+    print("=" * 60)
+    print(f"Backend  : {timing}"
+          + (f" (min of {repeat})" if timing == "real" else "")
+          + f" | key_bits={key_bits} | samples={num_samples} | beam={beam_width}")
+
+    # Victim key file (persisted so --reuse-key keeps the sample cache valid).
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        key_file = os.path.join(cache_dir, "victim_key.txt")
+    else:
+        key_file = os.path.join(_HERE, "subprocess_key.txt")
+
+    argv = list(target_argv) + [
+        "--key-bits", str(key_bits),
+        "--timing", timing,
+        "--repeat", str(repeat),
+        "--key-file", key_file,
+    ]
+    if use_sample_cache:
+        argv.append("--reuse-key")
+
+    print("Launching target:", " ".join(argv))
+    target = Target(argv)
+    n, e = target.n, target.e
+    print(f"Public key: n={n.bit_length()} bits, e={e:X}")
+
+    omega = getOmega(n)
+    k = limbsNr(n)
+    R = 1 << (64 * k)
+    R_mod_n = R % n
+
+    signature = _samples_signature(n, key_bits, timing, repeat)
+
+    # Samples: reuse cache as a prefix and collect only what is missing.
+    cached = None
+    if cache_dir is not None and use_sample_cache:
+        cached = load_samples_cache(cache_dir, signature)
+    have = 0 if cached is None else len(cached[0])
+    collect_log = None
+    if cached is not None and have >= num_samples:
+        cs = cached[0][:num_samples]
+        times = cached[1][:num_samples]
+        plaintexts = cached[2][:num_samples]
+        note = " (frozen noise realisation)" if timing == "real" else ""
+        print(f"  Reusing {num_samples} of {have} cached samples{note}; no queries.")
+    else:
+        if have > 0:
+            print(f"  Extending cache: {have} reused, collecting {num_samples - have} "
+                  f"new sample(s)...")
+        else:
+            print("Collecting samples from the oracle...")
+        new_cs, new_t, new_p, collect_log = collect_samples(
+            target, num_samples - have, start_index=have, verbose=verbose
+        )
+        if cached is not None:
+            cs = cached[0] + new_cs
+            times = cached[1] + new_t
+            plaintexts = cached[2] + new_p
+        else:
+            cs, times, plaintexts = new_cs, new_t, new_p
+        if cache_dir is not None and use_sample_cache:
+            save_samples_cache(cache_dir, signature, cs, times, plaintexts)
+            print(f"  Cached {len(cs)} samples -> "
+                  f"{os.path.join(cache_dir, 'samples.json')}")
+
     target.close()
-    print( "FOUND KEY = ", "{0:X}".format(int(key, 2)))
+    base_bars = [(c * R) % n for c in cs]
+
+    # True key (the victim saved it) — for diagnostics / accuracy / figures.
+    true_d = None
+    try:
+        with open(key_file) as fh:
+            true_d = int(fh.read().split("d:")[1].split("\n")[0].strip())
+    except Exception as exc:
+        print("  (could not read victim key for cross-check:", exc, ")")
+
+    def key_is_correct(key):
+        d = int(key, 2)
+        for i in range(min(6, len(cs))):
+            if pow(cs[i], d, n) != plaintexts[i]:
+                return False
+        return True
+
+    exact_oracle = all(float(t).is_integer() and 0 <= t < 1e6 for t in times)
+    unit = " reductions" if exact_oracle else " us"
+    scale = 1.0 if exact_oracle else 1e6
+
+    # Raw per-bit signal along the true key (SNR read, no error propagation).
+    diag = {}
+    if true_d is not None:
+        diag = oracle_separability(true_d, cs, times, base_bars, n, omega,
+                                   R_mod_n, unit)
+
+    # Recovery.
+    print("\nStarting recovery ...")
+    if exact_oracle:
+        print("  exact reduction-count oracle -> beam search")
+        recovered_key = recover_exact(cs, times, plaintexts, base_bars, n, omega,
+                                      R_mod_n, key_is_correct, verbose, beam_width)
+    else:
+        print("  real wall-clock oracle -> greedy statistical recovery")
+        recovered_key = recover_statistical(cs, times, plaintexts, base_bars, n,
+                                             omega, R_mod_n, key_is_correct, verbose)
+    recovered_d = int(recovered_key, 2)
+
+    # Per-bit figures + results (walk the recovered key).
+    bit_results, correct = [], 1
+    if true_d is not None:
+        bit_results, correct = analyze_and_plot(
+            recovered_key, true_d, cs, times, base_bars, n, omega, R_mod_n,
+            figures_dir, make_plots, unit, scale
+        )
+
+    nbits = len(recovered_key)
+    accuracy = correct / nbits if nbits else 0.0
+    full = (true_d is not None and recovered_d == true_d)
+    first_err = next((r["bit_position"] for r in bit_results if not r["success"]),
+                     nbits)
+
+    print("\n" + "=" * 60)
+    print("RESULTS")
+    print(f"  queries issued    : {target.queries}")
+    print(f"  recovered d bits  : {nbits}")
+    print(f"  recovered d (hex) : {recovered_d:X}")
+    if true_d is not None:
+        print(f"  true d (hex)      : {true_d:X}")
+        print(f"  per-bit accuracy  : {correct}/{nbits} = {accuracy*100:.1f}%")
+        print(f"  first error bit   : {first_err}")
+        print(f"  full recovery     : {'YES (SUCCESS)' if full else 'no (MISMATCH)'}")
+    diag["full_recovery"] = bool(full)
+    diag["first_error_bit"] = int(first_err)
+    diag["queries"] = int(target.queries)
+
+    # Per-sample oracle timing -> separate json (real mode).
+    if collect_log is not None and timing_out_path is not None:
+        secs = [r["reported_time"] for r in collect_log]
+        with open(timing_out_path, "w") as f:
+            json.dump({
+                "timing": timing,
+                "key_bits": key_bits,
+                "num_samples": len(collect_log),
+                "repeat": repeat,
+                "summary": {
+                    "count": len(secs),
+                    "mean": float(np.mean(secs)),
+                    "std": float(np.std(secs)),
+                    "min": float(np.min(secs)),
+                    "max": float(np.max(secs)),
+                },
+                "per_sample": collect_log,
+            }, f, indent=2)
+        print(f"  saved per-sample timing -> {timing_out_path}")
+
+    return recovered_d, accuracy, bit_results, diag
+
+
+if __name__ == "__main__":
+    # ------------------------------------------------------------------ #
+    # In-code configuration (no environment variables / CLI knobs).
+    # ------------------------------------------------------------------ #
+    # How to launch the victim.  Either drive main.py through this venv's
+    # interpreter, or point at the frozen exe.  The analysis-side settings
+    # (key size, oracle mode, ...) are configured here and passed to the victim.
+    PYTHON = os.path.join(os.path.dirname(_HERE), "venv", "Scripts", "python.exe")
+    MAIN_PY = os.path.join(os.path.dirname(_HERE), "main.py")
+    TARGET_ARGV = [PYTHON, MAIN_PY]
+    # TARGET_ARGV = [os.path.join(_HERE, "main.exe")]   # frozen victim instead
+
+    KEY_BITS = 128            # multiple of 64 so n fills the top limb (signal exists)
+    TIMING = "exact"          # "exact" (noise-free PoC) | "real" (wall-clock attack)
+    MONT_REPEAT = 5           # real mode only: victim reports min over this many runs
+    NUM_SAMPLES = 12000       # ciphertexts to collect / query
+    BEAM_WIDTH = 32           # exact-mode beam width
+    NUM_RUNS_ATTACK = 1       # independent full-attack repetitions
+    MAKE_PLOTS = True
+    USE_SAMPLE_CACHE = True   # persist+reuse victim key & samples across runs
+
+    CACHE_ROOT = os.path.join(_HERE, "mont_cache")
+    CACHE_DIR = os.path.join(CACHE_ROOT, f"keybits_{KEY_BITS}_{TIMING}")
+
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    results_dir = os.path.join(_HERE, "attack_mont_results", f"attack_results_{ts}")
+    os.makedirs(results_dir, exist_ok=True)
+
+    all_results = []
+    for i in range(NUM_RUNS_ATTACK):
+        print(f"\n{'=' * 50}\nRUN {i + 1}/{NUM_RUNS_ATTACK}\n{'=' * 50}")
+        run_dir = os.path.join(results_dir, f"run_{i + 1}")
+        figs_dir = os.path.join(run_dir, "figs")
+        os.makedirs(figs_dir, exist_ok=True)
+
+        recovered, accuracy, bit_results, diag = montgomery_attack(
+            target_argv=TARGET_ARGV,
+            key_bits=KEY_BITS,
+            timing=TIMING,
+            repeat=MONT_REPEAT,
+            num_samples=NUM_SAMPLES,
+            beam_width=BEAM_WIDTH,
+            cache_dir=CACHE_DIR,
+            use_sample_cache=USE_SAMPLE_CACHE,
+            figures_dir=figs_dir,
+            make_plots=MAKE_PLOTS,
+            timing_out_path=os.path.join(run_dir, "measurement_times.json"),
+        )
+
+        run_result = {
+            "recovered_key": recovered,
+            "accuracy": float(accuracy),
+            "timing": TIMING,
+            "key_bits": KEY_BITS,
+            "num_samples": NUM_SAMPLES,
+            "beam_width": BEAM_WIDTH,
+            "repeat": MONT_REPEAT,
+            "diagnostics": diag,
+            "bit_results": bit_results,
+        }
+        with open(os.path.join(run_dir, "results.json"), "w") as f:
+            json.dump(run_result, f, indent=2)
+        all_results.append(run_result)
+
+    with open(os.path.join(results_dir, "summary.json"), "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nAll results saved to: {results_dir}")

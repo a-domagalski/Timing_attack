@@ -61,6 +61,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 from bb_victim import (  # noqa: E402
     CRTRSAVictim, generate_crt_key, load_crt_key, save_crt_key,
 )
+import cpu_pin  # noqa: E402
+import coppersmith  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -148,11 +150,30 @@ def neighborhood_gap(victim, g, ghi, radix_inv, n, neigh, sample,
         tghi = neighborhood_time(victim, ghi, radix_inv, n, neigh, sample)
         return tg, tghi
 
+    # Fine-grained pairing hook (drift-targeted, for the remote/unpinned-victim
+    # oracle).  When the victim exposes ``measure_pair(cg, chi)`` we let IT pair
+    # the two neighbours at the *round-trip* level -- i.e. below the min
+    # estimator, not around it.  The block interleave above (measure(cg) then
+    # measure(chi)) still runs a whole `repeat`-block min on cg and then another
+    # on chi, so the two minima are drawn from time windows `repeat` round-trips
+    # apart and the victim's slow frequency drift does NOT cancel (this is why
+    # plain interleave measured ~= block on the unpinned host).  ``measure_pair``
+    # instead interleaves cg/chi round-trips and returns a pair measured at the
+    # SAME instant (same victim frequency) with the one-sided IPC/interrupt noise
+    # rejected, so the drift is truly common-mode in ``Tg - Tghi``.  Victims that
+    # do not implement it (the in-process rdtsc victims) fall back to the exact
+    # previous behaviour, so this is backward compatible.
+    use_pair = sample <= 1 and hasattr(victim, "measure_pair")
+
     tg = tghi = 0.0
     for k in range(neigh):
         cg = cipher_for(g + k, radix_inv, n)
         chi = cipher_for(ghi + k, radix_inv, n)
-        if sample <= 1:
+        if use_pair:
+            dg, dh = victim.measure_pair(cg, chi)
+            tg += dg
+            tghi += dh
+        elif sample <= 1:
             tg += victim.measure(cg)
             tghi += victim.measure(chi)      # measured immediately after cg
         else:
@@ -261,6 +282,31 @@ def complete_by_bruteforce(n, prefix, tail_brute, max_brute=26):
     return None
 
 
+def complete_factor(n, prefix, unknown_bits, beta=0.5, max_brute=26,
+                    verbose=False):
+    """Finish factoring N from a recovered top-bits prefix of q.
+
+    This is the Brumley-Boneh finish (paper Section 3): "After recovering the
+    half-most significant bits of q, we can use Coppersmith's algorithm [3] to
+    retrieve the complete factorization."  For a tiny unknown tail
+    (`unknown_bits <= max_brute`) a direct brute force is cheaper and always
+    works; for a larger tail (up to ~N**(1/4), i.e. roughly the top half of q
+    known) we invoke the univariate Coppersmith solver.  Returns a factor of N
+    or None.
+    """
+    if unknown_bits <= 0:
+        return prefix if (prefix > 1 and n % prefix == 0) else None
+    if prefix > 1 and n % prefix == 0:        # exact prefix already divides N
+        return prefix
+    if unknown_bits <= max_brute:
+        return complete_by_bruteforce(n, prefix, unknown_bits, max_brute)
+    q = coppersmith.factor_with_high_bits(n, prefix, 1 << unknown_bits, beta=beta)
+    if verbose:
+        print("  [coppersmith] unknown_bits=%d -> %s"
+              % (unknown_bits, "factored" if q else "no root (need more bits)"))
+    return q
+
+
 # --------------------------------------------------------------------------- #
 # Confidence-based beam / backtracking factor recovery.
 #
@@ -302,9 +348,46 @@ class _BeamCand:
         self.records = records              # per-bit records along THIS path
 
 
+# --------------------------------------------------------------------------- #
+# Checkpoint / resume support for the (multi-hour) beam recovery.
+#
+# The beam state after processing each bit is fully described by the surviving
+# candidates (prefix g, cumulative score, running max +gap, per-bit records) plus
+# which bit comes next.  Persisting that atomically after every bit lets a run be
+# interrupted (Ctrl-C, crash, reboot) and resumed from the last completed bit --
+# only the timing measurements already spent are lost, not the recovered prefix.
+# Measurements are NOT reused across sessions (the interleaved-min oracle measures
+# each (g,ghi) pair fresh anyway), so a resumed run simply continues the search
+# on a freshly reconnected victim serving the SAME key.
+# --------------------------------------------------------------------------- #
+def _serialize_beam(beam):
+    return [{"g": "%X" % c.g, "score": c.score,
+             "max_pos_delta": c.max_pos_delta, "records": c.records}
+            for c in beam]
+
+
+def _deserialize_beam(data):
+    return [_BeamCand(int(d["g"], 16), float(d["score"]),
+                      float(d["max_pos_delta"]), list(d["records"]))
+            for d in data]
+
+
+def _write_beam_checkpoint(path, payload):
+    """Atomically write the checkpoint (tmp + os.replace) so an interruption
+    mid-write can never corrupt the file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh)
+    os.replace(tmp, path)
+
+
 def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
                         tail_brute=0, adaptive_neigh=True, tau_frac=0.3,
-                        beam_width=8, interleave=False, verbose=True):
+                        beam_width=8, interleave=False, beta=0.5,
+                        refresh_draws=3, verbose=True,
+                        checkpoint_path=None, resume=False,
+                        stop_on_wrong_bit=True, beam_out=None,
+                        include_leaf_records=False):
     """Beam / backtracking version of :func:`recover_factor`.
 
     Returns ``(prefix_g, records, q_rec)`` where ``prefix_g``/``records`` belong
@@ -325,25 +408,69 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
     top = 1 << (qbits - 1)                   # top bit of q is 1 by definition
     beam = [_BeamCand(top, 0.0, 0.0, [])]
 
+    # Resume from a checkpoint if one is present and matches this run.
+    start_idx = 0
+    if resume and checkpoint_path and os.path.exists(checkpoint_path):
+        ck = None
+        try:
+            with open(checkpoint_path) as fh:
+                ck = json.load(fh)
+        except Exception as exc:
+            if verbose:
+                print("  [resume] ignoring unreadable checkpoint: %r" % exc)
+        if ck is not None:
+            matches = (int(ck.get("n_hex", "0"), 16) == n
+                       and ck.get("qbits") == qbits
+                       and ck.get("stop_bit") == stop_bit
+                       and ck.get("beam_width") == beam_width)
+            if not matches:
+                if verbose:
+                    print("  [resume] checkpoint key/params differ from this "
+                          "run -> starting fresh")
+            else:
+                beam = _deserialize_beam(ck["beam"])
+                start_idx = int(ck["next_idx"])
+                victim.queries = int(ck.get("queries_so_far", 0))
+                if verbose:
+                    print("  [resume] restored beam (%d cand) at bit index %d; "
+                          "%d prior round-trips carried over"
+                          % (len(beam), start_idx, victim.queries))
+
     # Cache neighborhood measurements by (g, ne): different beam paths (or the
     # bit-0 child of one prefix and the bit-1 child of another) can request the
-    # same g, and the aggregate depends only on (g, ne).  Keeps the query count
-    # from blowing up by the full beam_width where prefixes coincide.
-    # NOTE: this cross-depth cache is only sound WITHOUT interleaving; when
-    # interleaving we must measure each (g, ghi) pair fresh (see neighborhood_gap).
-    meas_cache = {}
+    # same g, and the aggregate depends only on (g, ne).
+    # REFRESH-MIN (2026-09-11): the noise is one-sided interrupt contamination
+    # removed by a MIN estimator, but a single cached neighborhood draw can still
+    # land in a busy window and, if reused across every beam node, poison the
+    # whole search (observed: perfect top-bit AUC yet recovery derailed ~bit 12).
+    # So instead of caching ONE draw, we take up to `refresh_draws` FRESH
+    # neighborhood measurements per (g, ne) -- across repeated visits -- and keep
+    # the running MINIMUM.  A bad draw is then corrected by later clean draws
+    # (min over draws -> the uncontaminated floor), while the count cap keeps the
+    # query cost bounded.  (Sound only WITHOUT interleaving; the interleaved path
+    # measures each (g, ghi) pair fresh -- see neighborhood_gap.)
+    meas_cache = {}                          # (g,ne) -> [min_val, n_draws]
 
     def measure_g(g, ne):
         key = (g, ne)
-        val = meas_cache.get(key)
-        if val is None:
-            val = neighborhood_time(victim, g, radix_inv, n, ne, sample)
-            meas_cache[key] = val
-        return val
+        entry = meas_cache.get(key)
+        if entry is not None and entry[1] >= refresh_draws:
+            return entry[0]
+        val = neighborhood_time(victim, g, radix_inv, n, ne, sample)
+        if entry is None:
+            meas_cache[key] = [val, 1]
+        else:
+            if val < entry[0]:
+                entry[0] = val
+            entry[1] += 1
+        return meas_cache[key][0]
 
     total = qbits - 1 - stop_bit
     t0 = time.perf_counter()
+    processed = 0                            # bits done THIS session (for ETA)
     for idx, i in enumerate(range(qbits - 2, stop_bit - 1, -1)):
+        if idx < start_idx:                  # already completed in a prior run
+            continue
         ne = min(neigh, max(1, 1 << i)) if adaptive_neigh else neigh
         actual = (q >> i) & 1
         children = []
@@ -393,11 +520,34 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
                 children.append(nc)
         children.sort(key=lambda c: c.score, reverse=True)
         beam = children[:beam_width]
+        processed += 1
+
+        # Annotate the just-decided bit of every surviving path with the
+        # cumulative query count and elapsed time, so the saved per-bit records
+        # yield "measurements/runtime vs recovered bits" curves for the thesis.
+        # (Cumulative queries carry across resume; elapsed_s is per-session.)
+        _q_now = victim.queries
+        _el_now = time.perf_counter() - t0
+        for _c in beam:
+            if _c.records:
+                _c.records[-1]["queries"] = _q_now
+                _c.records[-1]["elapsed_s"] = _el_now
+
+        # Persist the beam AFTER this bit so an interruption resumes from here.
+        if checkpoint_path is not None:
+            _write_beam_checkpoint(checkpoint_path, {
+                "n_hex": "%X" % n, "qbits": qbits, "stop_bit": stop_bit,
+                "beam_width": beam_width, "neigh": neigh, "sample": sample,
+                "interleave": interleave, "tau_frac": tau_frac,
+                "next_idx": idx + 1, "queries_so_far": victim.queries,
+                "beam": _serialize_beam(beam),
+            })
 
         if verbose and (idx % max(1, (qbits // 20)) == 0 or i == stop_bit):
             elapsed = time.perf_counter() - t0
             done = idx + 1
-            eta = elapsed / done * (total - done)
+            rate = elapsed / processed if processed else 0.0
+            eta = rate * (total - done)
             best = beam[0]
             acc = (sum(r["correct"] for r in best.records) / len(best.records)
                    if best.records else 0.0)
@@ -407,6 +557,28 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
                 % (done, total, len(beam), 100 * acc, victim.queries,
                    elapsed, eta))
             sys.stdout.flush()
+
+        # --- stop_on_wrong_bit (EVALUATION-ONLY early stop; easily removable) ---
+        # Toggle; default True.  Uses the known secret q (already read above for
+        # the per-bit `correct`/`actual` records and diagnostics) to detect when
+        # the recovery has derailed UNRECOVERABLY -- i.e. the true prefix is no
+        # longer held by ANY surviving beam candidate.  Once that happens the
+        # search can never factor N (every deeper bit is measured against a wrong
+        # prefix), so we stop and return the results gathered so far instead of
+        # grinding the remaining bits for hours.  Set stop_on_wrong_bit=False to
+        # let the run go to completion regardless (e.g. to study post-derail
+        # behaviour).  Delete this whole block to remove the feature entirely.
+        if stop_on_wrong_bit:
+            true_path_alive = any(all(r["correct"] for r in c.records)
+                                  for c in beam)
+            if not true_path_alive:
+                if verbose:
+                    sys.stdout.write("\n")
+                    print("  [stop_on_wrong_bit] correct path left the beam by "
+                          "bit pos %d (recovered bit %d/%d); stopping early and "
+                          "returning partial results." % (i, idx + 1, total))
+                break
+        # --- end stop_on_wrong_bit -------------------------------------------- #
     if verbose:
         sys.stdout.write("\n")
 
@@ -415,13 +587,35 @@ def recover_factor_beam(victim, radix_inv, qbits, neigh=64, sample=1,
     q_rec = None
     for rank, cand in enumerate(sorted(beam, key=lambda c: c.score,
                                         reverse=True)):
-        cand_q = complete_by_bruteforce(n, cand.g, stop_bit)
+        cand_q = complete_factor(n, cand.g, stop_bit, beta=beta)
         if cand_q is not None:
             q_rec = cand_q
             if verbose:
                 print("  [beam] N factored from beam rank %d/%d "
                       "(score %.4g)" % (rank + 1, len(beam), cand.score))
             break
+
+    # Expose EVERY surviving beam-leaf prefix (best score first) so a robust
+    # external finisher (fpylll) can try each one -- the fully-correct prefix is
+    # often NOT the top-scoring leaf on the noisy oracle, and the in-repo
+    # pure-Python Coppersmith is too fragile to factor it here.  `leading` (the
+    # consecutive-correct top bits) is evaluation-only, for reporting which leaf
+    # is the true one.
+    if beam_out is not None:
+        for cand in sorted(beam, key=lambda c: c.score, reverse=True):
+            lead = 0
+            for r in cand.records:
+                if r["correct"]:
+                    lead += 1
+                else:
+                    break
+            entry = {"prefix_hex": "%X" % cand.g,
+                     "score": cand.score, "leading_correct": lead}
+            if include_leaf_records:
+                # full per-bit series for THIS leaf (delta/tau/Tg/Tghi/...),
+                # so every candidate -- not just the top path -- is plottable.
+                entry["records"] = cand.records
+            beam_out.append(entry)
 
     best = max(beam, key=lambda c: c.score)
     return best.g, best.records, q_rec
@@ -698,11 +892,37 @@ def plot_gap_histogram(records, figs_dir, timing):
 # --------------------------------------------------------------------------- #
 def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
         recover_bits=None, tail_brute=16, beam_width=1, interleave=False,
+        refresh_draws=3,
         karatsuba=False, kara_threshold_limbs=8, kara_gain=1.0,
-        kara_cyc_per_unit=4.0, make_plots=True, use_key_cache=True,
+        kara_cyc_per_unit=4.0, pin_cpu=False, pin_core=0, warmup_s=0.0,
+        key_source="random", make_plots=True, use_key_cache=True,
         results_root=None, cache_root=None, verbose=True):
     """Full attack + characterization + figures + JSON.  Returns results dict."""
-    results_root = results_root or os.path.join(_HERE, "bb_results")
+    # Pin the measurement environment BEFORE any timing (real mode).  Reduces
+    # scheduler/migration jitter; does NOT disable turbo (see cpu_pin docstring
+    # / cpu_pin.power_plan_guide() for the admin power-plan step that does).
+    pin_status = None
+    if pin_cpu:
+        pin_status = cpu_pin.pin_process(core=pin_core, high_priority=True,
+                                         verbose=verbose)
+        if warmup_s and warmup_s > 0:
+            if verbose:
+                print("[cpu_pin] warming up %.2fs to a steady frequency ..."
+                      % warmup_s)
+            cpu_pin.warmup(warmup_s)
+    # In-process attack -> grouped under inprocess_victim/ by oracle regime, so
+    # results are organised the same way as the runs in the work log:
+    #   exact_oracle   : noise-free extra-reduction count (pinning irrelevant)
+    #   real_pinned    : wall-clock with cpu_pin engaged
+    #   real_unpinned  : wall-clock without pinning (the pre-pinning baseline)
+    # Callers may override results_root explicitly.
+    if results_root is None:
+        if timing == "exact":
+            regime = "exact_oracle"
+        else:
+            regime = "real_pinned" if pin_cpu else "real_unpinned"
+        results_root = os.path.join(_HERE, "bb_results", "inprocess_victim",
+                                    regime)
     cache_root = cache_root or os.path.join(_HERE, "bb_cache")
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = os.path.join(results_root, "%s_%s_kb%d" % (ts, timing, key_bits))
@@ -710,16 +930,22 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
     os.makedirs(figs_dir, exist_ok=True)
 
     # --- key (cached so reruns hit the same target q) --- #
-    key_dir = os.path.join(cache_root, "keybits_%d" % key_bits)
+    # cache is tagged by source so random/provable keys don't collide; the
+    # provable modulus may be key_bits-1 bits, so accept a 1-bit tolerance.
+    key_dir = os.path.join(cache_root, "keybits_%d_%s" % (key_bits, key_source))
     os.makedirs(key_dir, exist_ok=True)
     key_path = os.path.join(key_dir, "key.json")
+
+    def _key_ok(k):
+        return abs(k["n"].bit_length() - key_bits) <= 1
+
     if use_key_cache and os.path.exists(key_path):
         key = load_crt_key(key_path)
-        if key["n"].bit_length() != key_bits:
-            key = generate_crt_key(key_bits)
+        if not _key_ok(key):
+            key = generate_crt_key(key_bits, source=key_source)
             save_crt_key(key_path, key)
     else:
-        key = generate_crt_key(key_bits)
+        key = generate_crt_key(key_bits, source=key_source)
         save_crt_key(key_path, key)
 
     victim = CRTRSAVictim(key, timing=timing, batch=batch, repeat=repeat,
@@ -739,11 +965,18 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
         "  modulus N        : %d bits" % n.bit_length(),
         "  target factor q  : %d bits (attacker estimate qbits=%d)"
         % (qbits_true, qbits),
+        "  key source       : %s (%s primes)"
+        % (key_source,
+           "FIPS 186-5 provable" if key_source == "provable" else "random"),
         "  timing oracle    : %s" % timing,
         "  neighborhood n   : %d   sample size s : %d" % (neigh, sample),
         "  real batch/repeat: %d / %d" % (batch, repeat) if timing == "real"
         else "  (exact oracle: extra-reduction counts, noise-free)",
         "  R^{-1} trick     : submit c = g * R^{-1} mod N (base = g mod q)",
+        "  cpu pin          : %s"
+        % ("core %d, high priority%s" % (
+              pin_core, (", warmup %.2gs" % warmup_s) if warmup_s else "")
+           if pin_cpu else "off (unpinned; see cpu_pin.power_plan_guide())"),
         "  channel          : %s"
         % ("extra reduction + Karatsuba/schoolbook mult (gain %.3g, thr %d limbs)"
            % (kara_gain, kara_threshold_limbs) if karatsuba
@@ -790,20 +1023,25 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
     stop_bit = qbits - 1 - recover_bits
     tb = stop_bit
     use_beam = beam_width and beam_width > 1
+    # q >= N^beta for balanced primes (q < p) -> beta ~ 0.5; used by the
+    # Coppersmith finish (needs the unknown tail < ~N^(beta^2) ~ N^0.25).
+    beta = min(0.5, qbits / n.bit_length())
+    finish = ("Coppersmith" if tb > 26 else "brute-force")
     if verbose:
         print("[*] recovering q by %s (zero-one gap%s): "
-              "bits %d..%d, then brute-force %d low bits"
+              "bits %d..%d, then %s the low %d bits"
               % ("beam search (width %d)" % beam_width if use_beam
                  else "greedy binary search",
                  ", interleaved" if interleave else "",
-                 qbits - 2, stop_bit, tb))
+                 qbits - 2, stop_bit, finish, tb))
     q_start = time.perf_counter()
     q_rec = None
     if use_beam:
         prefix, records, q_rec = recover_factor_beam(
             victim, radix_inv, qbits, neigh=neigh, sample=sample,
             tail_brute=tb, adaptive_neigh=True, beam_width=beam_width,
-            interleave=interleave, verbose=verbose)
+            interleave=interleave, beta=beta, refresh_draws=refresh_draws,
+            verbose=verbose)
     else:
         prefix, records = recover_factor(
             victim, radix_inv, qbits, neigh=neigh, sample=sample,
@@ -822,7 +1060,7 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
     factored = False
     d_rec = None
     if q_rec is None:
-        q_rec = complete_by_bruteforce(n, prefix, tb)
+        q_rec = complete_factor(n, prefix, tb, beta=beta, verbose=verbose)
     if q_rec is not None and n % q_rec == 0:
         factored = True
         p_rec = n // q_rec
@@ -853,6 +1091,9 @@ def run(key_bits=256, timing="exact", neigh=64, sample=1, batch=64, repeat=1,
             "kara_threshold_limbs": kara_threshold_limbs,
             "kara_gain": kara_gain,
             "kara_cyc_per_unit": kara_cyc_per_unit,
+            "pin_cpu": pin_cpu, "pin_core": pin_core, "warmup_s": warmup_s,
+            "pin_status": pin_status,
+            "key_source": key_source,
         },
         "modulus_bits": n.bit_length(),
         "qbits_true": qbits_true,
@@ -916,6 +1157,10 @@ if __name__ == "__main__":
     # -------------------------------- CONFIG -------------------------------- #
     KEY_BITS = 256          # modulus size (balanced primes; q ~ KEY_BITS/2 bits)
     TIMING = "exact"        # "exact" (noise-free, factors N) | "real" (rdtsc)
+    KEY_SOURCE = "random"   # "random" (fast, exact bit length) | "provable"
+                            #     (FIPS 186-5 via generate_provable_prime_pair;
+                            #     KEY_BITS must be in provable_prime.VALID_NLEN,
+                            #     modulus may be KEY_BITS or KEY_BITS-1 bits)
     NEIGHBORHOOD = 64       # summed consecutive ciphertexts per guess
     SAMPLE_SIZE = 1         # median over this many measures (raise for real)
     TAIL_BRUTE = 16         # brute-force the lowest N bits at the end (both modes)
@@ -934,6 +1179,11 @@ if __name__ == "__main__":
     KARA_THRESHOLD_LIMBS = 8    # OpenSSL-style Karatsuba word-count threshold
     KARA_GAIN = 1.0             # scales the modeled multiplication contribution
     KARA_CYC_PER_UNIT = 4.0     # real mode: cycles per modeled word-product
+    PIN_CPU = False         # real mode: pin to one core + high priority to cut
+                            #     scheduler/migration jitter (does NOT disable
+                            #     turbo -- see cpu_pin.power_plan_guide()).
+    PIN_CORE = 0            # which logical core to pin to
+    WARMUP_S = 0.0         # busy-loop seconds before measuring (steady freq)
     BATCH = 64              # real mode: rdtsc-timed ladders averaged per half
     REPEAT = 1              # real mode: min over this many batch-averages
     MAKE_PLOTS = True
@@ -944,5 +1194,6 @@ if __name__ == "__main__":
         sample=SAMPLE_SIZE, batch=BATCH, repeat=REPEAT, tail_brute=TAIL_BRUTE,
         beam_width=BEAM_WIDTH, interleave=INTERLEAVE, karatsuba=KARATSUBA,
         kara_threshold_limbs=KARA_THRESHOLD_LIMBS, kara_gain=KARA_GAIN,
-        kara_cyc_per_unit=KARA_CYC_PER_UNIT, make_plots=MAKE_PLOTS,
+        kara_cyc_per_unit=KARA_CYC_PER_UNIT, pin_cpu=PIN_CPU, pin_core=PIN_CORE,
+        warmup_s=WARMUP_S, key_source=KEY_SOURCE, make_plots=MAKE_PLOTS,
         use_key_cache=USE_KEY_CACHE, verbose=True)

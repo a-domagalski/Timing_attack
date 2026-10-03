@@ -5,7 +5,7 @@ from tools.gen_use_funs import mult_inv, sha3_256_int, bits_to_int, int_to_bytes
 from math import ceil, gcd, isqrt
 
 # Valid nlen values according to FIPS 186-5 Section 5.1 (typical sizes)
-VALID_NLEN = {1024, 2048, 3072, 4096}
+VALID_NLEN = {64, 128, 256, 512, 1024, 2048, 3072, 4096} # added 512 at later stage, initially wasn't there; added 64/128/256 for small-key testing
 
 '''
  4096-bit shows up in VALID_NLEN even though it's absent from your security map
@@ -19,6 +19,10 @@ VALID_NLEN = {1024, 2048, 3072, 4096}
 #TODO clear of chat comments
 # Mapping from nlen to security_strength in bits (based on SP 800-57 Part 1)
 SECURITY_STRENGTH_MAP = {
+    64: 32,  # added for small-key testing
+    128: 64, # added for small-key testing
+    256: 80, # added for small-key testing (previously only in VALID_NLEN)
+    512: 80, #added 512 at later stage, initially wasn't there
     1024: 80,
     2048: 112,
     3072: 128,
@@ -53,10 +57,12 @@ def generate_provable_prime_pair(nlen, e, seed):
     """
     Implementation based on FISP 186-5: A 1.2.2
     """
-    if nlen < 2048:
-        return FAILURE, 0, 0
+    # if nlen < 2048:
+    #     return FAILURE, 0, 0
     if e <= 65536 or e >= (1 << 256) or e % 2 == 0: #If ((e ≤ 2^16) OR (e ≥ 2^256) OR (e is not odd))
-        return FAILURE, 0, 0
+        # Relax lower bound for small keys (nlen < 256) where e may be smaller than 65537
+        if not (nlen < 256 and e > 2 and e % 2 != 0):
+            return FAILURE, 0, 0
     security_strength = SECURITY_STRENGTH_MAP.get(nlen)
     if len(seed) < 2 * security_strength:
         return FAILURE, 0, 0
@@ -71,8 +77,10 @@ def generate_provable_prime_pair(nlen, e, seed):
         if not status:
             return FAILURE, 0, 0
         working_seed = qseed
-        if not abs(p - q) <= (1 << ((nlen >> 1)  - 100)):
-            break
+        half = nlen >> 1
+        if half > 100 and abs(p - q) <= (1 << (half - 100)):
+            continue  # p and q too close, retry
+        break
     pseed = 0
     qseed = 0
     working_seed = 0
@@ -183,6 +191,10 @@ def auxilary_prime_len_acceptable(n, l):
     """
     if n == 1:
         return True
+    if l <= 128 and n > 0:  # added for small-key testing (l = nlen/2, so covers nlen ≤ 256)
+        return True
+    if l == 256 and n > 0: # added 512 at later stage, initially wasn't there
+      return True
     if 2048 <= l <= 3071 and n > 140:
         return True
     if 3072 <= l <= 4095 and n > 170:

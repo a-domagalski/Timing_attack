@@ -92,8 +92,23 @@ from sympy import randprime  # noqa: E402
 # --------------------------------------------------------------------------- #
 # Key generation (fast demo key; balanced primes with q < p so we target q).
 # --------------------------------------------------------------------------- #
-def generate_crt_key(bits: int, e: int = 65537) -> dict:
-    """Return a CRT-RSA key dict for a random ~`bits` modulus with q < p."""
+def generate_crt_key(bits: int, e: int = 65537, source: str = "random") -> dict:
+    """Return a CRT-RSA key dict for a ~`bits` modulus with q < p.
+
+    source="random"   : fast probabilistic primes (sympy.randprime); the modulus
+                        is exactly `bits` bits.  Default -- used for the small,
+                        tunable attack experiments.
+    source="provable" : FIPS 186-5 provable primes via the project's own
+                        generate_provable_prime_pair (the same core CustomRSA
+                        uses); see _generate_crt_key_provable.  `bits` must be in
+                        provable_prime.VALID_NLEN; the modulus may be `bits` or
+                        `bits-1` bits (tolerated by design).
+    """
+    if source == "provable":
+        return _generate_crt_key_provable(bits, e)
+    if source != "random":
+        raise ValueError("unknown key source %r (use 'random' or 'provable')"
+                         % source)
     half = bits // 2
     while True:
         p = randprime(1 << (half - 1), 1 << half)
@@ -120,6 +135,45 @@ def generate_crt_key(bits: int, e: int = 65537) -> dict:
             "d2": d % (q - 1),
             "qinv": pow(q, -1, p),
         }
+
+
+def _generate_crt_key_provable(bits: int, e: int = 65537) -> dict:
+    """CRT-RSA key from the project's FIPS 186-5 provable-prime generator.
+
+    Uses provable_prime.get_seed + generate_provable_prime_pair (the core behind
+    CustomRSA), orders q < p (attack target = smaller factor), derives the CRT
+    parameters, and tolerates a modulus of `bits` or `bits-1` bits (a product of
+    two bits/2-bit provable primes is not guaranteed to fill `bits` exactly)."""
+    # imported lazily: the provable path pulls in the DRBG / cryptography stack.
+    from provable_prime import get_seed, generate_provable_prime_pair
+
+    st_seed, seed = get_seed(bits)
+    if not st_seed:
+        raise ValueError(
+            "provable key: get_seed failed for nlen=%d (must be one of "
+            "provable_prime.VALID_NLEN: 64,128,256,512,1024,2048,3072,4096)"
+            % bits)
+    st, p, q = generate_provable_prime_pair(bits, e, seed)
+    if not st:
+        raise ValueError(
+            "provable key: generate_provable_prime_pair failed for nlen=%d, "
+            "e=%d" % (bits, e))
+    if q > p:                       # convention: q is the SMALLER factor
+        p, q = q, p
+    if p == q:
+        raise ValueError("provable key: p == q")
+    n = p * q
+    if n.bit_length() not in (bits, bits - 1):   # tolerate the +/-1-bit modulus
+        raise ValueError("provable key: unexpected modulus size %d bits "
+                         "(wanted %d or %d)" % (n.bit_length(), bits, bits - 1))
+    phi = (p - 1) * (q - 1)
+    if gcd(e, phi) != 1:
+        raise ValueError("provable key: e=%d not coprime to phi" % e)
+    d = pow(e, -1, phi)
+    return {
+        "bits": bits, "n": n, "e": e, "d": d, "p": p, "q": q,
+        "d1": d % (p - 1), "d2": d % (q - 1), "qinv": pow(q, -1, p),
+    }
 
 
 def save_crt_key(path: str, key: dict) -> None:
@@ -329,6 +383,9 @@ def parse_args():
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--reuse-key", action="store_true")
     ap.add_argument("--key-file", default="subprocess_key_bb.json")
+    ap.add_argument("--key-source", choices=["random", "provable"],
+                    default="random",
+                    help="random (fast) or provable (FIPS 186-5) primes")
     ap.add_argument("--karatsuba", action="store_true",
                     help="add the modeled Karatsuba<->schoolbook mult channel")
     ap.add_argument("--kara-threshold-limbs", type=int, default=8)
@@ -350,12 +407,12 @@ def main():
     if args.reuse_key and os.path.exists(args.key_file):
         try:
             key = load_crt_key(args.key_file)
-            if key["n"].bit_length() != args.key_bits:
+            if abs(key["n"].bit_length() - args.key_bits) > 1:
                 key = None
         except Exception:
             key = None
     if key is None:
-        key = generate_crt_key(args.key_bits)
+        key = generate_crt_key(args.key_bits, source=args.key_source)
     try:
         save_crt_key(args.key_file, key)
     except OSError:
