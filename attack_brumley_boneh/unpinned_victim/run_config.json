@@ -1,0 +1,32 @@
+{
+  "_comment": "Reproduces the parameters of the FIRST successful whole-key recovery over the unpinned-victim channel (results dir remote_2026-09-21_07-48-57_kb256). NOTE: the channel is noisy -> same params improve the odds but do NOT guarantee success (run-to-run derail lottery). Run: python attack_remote.py full --config run_config.json",
+
+  "mode": "full",
+
+  "key_bits": 256,
+  "key_source": "provable",
+  "server_batch": 80,
+
+  "pin_core": 0,
+  "warmup_s": 1.5,
+
+  "repeat": 64,
+  "neigh": 128,
+  "sample": 1,
+  "beam": 16,
+  "refresh_draws": 3,
+  "interleave": true,
+  "tail_brute": 56,
+
+  "stop_on_wrong_bit": true,
+  "resume": true,
+  "save_all_leaf_records": true,
+  "checkpoint_path": null,
+
+  "use_wsl_fpylll": true,
+  "wsl_activate": "~/cop/bin/activate",
+  "wsl_brute": 8,
+  "wsl_sweep_max": 62,
+  "wsl_distro": "",
+  "wsl_timeout_s": 1800
+}

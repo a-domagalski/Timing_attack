@@ -1,0 +1,39 @@
+{
+  "_comment": "Run config for attack_remote.py. Copy/edit and pass with: python attack_remote.py full --config <this-file>. Any key omitted keeps its built-in default; a null value or an underscore-prefixed key is ignored. 'mode' (full|diag|smoke|partial) is optional and is overridden by an explicit CLI mode token.",
+
+  "mode": "full",
+
+  "key_bits": 256,
+  "key_source": "provable",
+  "server_batch": 80,
+
+  "pin_core": 0,
+  "warmup_s": 1.5,
+
+  "repeat": 64,
+  "neigh": 128,
+  "sample": 1,
+  "beam": 16,
+  "refresh_draws": 3,
+  "interleave": true,
+  "tail_brute": 56,
+
+  "stop_on_wrong_bit": true,
+  "resume": true,
+  "save_all_leaf_records": true,
+  "checkpoint_path": null,
+
+  "diag_top_bits": 5,
+  "diag_neigh": 96,
+  "diag_trials": 4,
+
+  "partial_top_bits": 6,
+  "partial_beam": 4,
+
+  "use_wsl_fpylll": true,
+  "wsl_activate": "~/cop/bin/activate",
+  "wsl_brute": 8,
+  "wsl_sweep_max": 62,
+  "wsl_distro": "",
+  "wsl_timeout_s": 1800
+}
